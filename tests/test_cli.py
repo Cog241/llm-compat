@@ -28,10 +28,25 @@ def _run_args(server: MockAPIServer, *extra: str) -> list[str]:
     ]
 
 
+def test_unexpected_cli_error_is_reported_without_details(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def boom(args: object) -> int:
+        raise RuntimeError('secret-value')
+
+    monkeypatch.setattr('llm_compat.cli._cmd_checks', boom)
+
+    assert main(['checks']) == 1
+    captured = capsys.readouterr()
+    assert 'unexpected internal error' in captured.err
+    assert 'secret-value' not in captured.err
+
+
 def test_checks_command_lists_catalog(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(['checks']) == 0
     output = capsys.readouterr().out
-    assert 'Built-in checks (8)' in output
+    assert 'Built-in checks (14)' in output
     assert 'connectivity' in output
     assert 'requires a model' in output
 
@@ -39,8 +54,10 @@ def test_checks_command_lists_catalog(capsys: pytest.CaptureFixture[str]) -> Non
 def test_checks_command_json(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(['checks', '--format', 'json']) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert len(payload['checks']) == 8
-    assert {check['id'] for check in payload['checks']} >= {'connectivity', 'tools', 'json'}
+    assert len(payload['checks']) == 14
+    ids = {check['id'] for check in payload['checks']}
+    assert ids >= {'connectivity', 'tools', 'json', 'json_schema', 'reasoning'}
+    assert any(not check['default_enabled'] for check in payload['checks'])
 
 
 def test_providers_command(capsys: pytest.CaptureFixture[str]) -> None:
@@ -133,13 +150,40 @@ def test_dry_run_makes_no_requests(
     assert mock_server.requests == []
 
 
+def test_dry_run_redacts_a_key_embedded_in_the_url_path(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = 'path-embedded-secret-value'
+    monkeypatch.setenv('LLM_COMPAT_PATH_KEY', secret)
+    code = main(
+        [
+            'run',
+            '--provider',
+            'custom',
+            '--base-url',
+            f'https://api.example.com/v1/{secret}',
+            '--api-key-env',
+            'LLM_COMPAT_PATH_KEY',
+            '--model',
+            'mock-chat',
+            '--dry-run',
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert '[REDACTED]' in captured.out
+
+
 def test_dry_run_json_reports_shared_models_request(
     mock_server: MockAPIServer,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert main(_run_args(mock_server, '--dry-run', '--format', 'json')) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload['estimated_requests'] == 6
+    assert payload['estimated_requests'] == 7
     assert mock_server.requests == []
 
 
@@ -324,5 +368,5 @@ def test_runner_extra_import_guard() -> None:
     # Keep a direct import of public API symbols exercised by the test suite.
     import llm_compat
 
-    assert llm_compat.__version__ == '0.1.0'
+    assert llm_compat.__version__ == '0.2.0'
     assert callable(llm_compat.run_compatibility)

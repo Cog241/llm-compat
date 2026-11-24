@@ -2,20 +2,52 @@
 
 from __future__ import annotations
 
+import ipaddress
 import math
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
 from llm_compat.errors import ConfigurationError
 
 _TOKEN_SEPARATORS = frozenset('()<>@,;:\\"/[]?={} \t')
+_SENSITIVE_HEADER_NAMES = frozenset(
+    {
+        'authorization',
+        'proxy-authorization',
+        'api-key',
+        'x-api-key',
+        'x-auth-token',
+        'x-access-token',
+        'x-goog-api-key',
+        'api_key',
+        'apikey',
+        'x-api-token',
+        'x-auth-key',
+        'x-secret-key',
+        'openai-api-key',
+        'anthropic-api-key',
+        'x-openai-api-key',
+        'x-api-secret',
+    }
+)
 
 
 def _has_control_characters(value: str) -> bool:
     return any(ord(char) < 32 or 0x7F <= ord(char) <= 0x9F for char in value)
+
+
+def _is_loopback_host(host: str) -> bool:
+    '''Return True for localhost and IP loopback addresses.'''
+    normalized = host.lower().rstrip('.')
+    if normalized == 'localhost' or normalized.endswith('.localhost'):
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def _is_header_name(value: str) -> bool:
@@ -34,6 +66,7 @@ class ProviderConfig:
     model: Optional[str] = None
     timeout: float = 30.0
     extra_headers: Mapping[str, str] = field(default_factory=dict, repr=False)
+    allow_insecure_http: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.base_url, str):
@@ -44,7 +77,10 @@ class ProviderConfig:
         if any(char.isspace() for char in base_url):
             raise ConfigurationError('base_url must not contain internal whitespace.')
 
-        parts = urlsplit(base_url)
+        try:
+            parts = urlsplit(base_url)
+        except ValueError as exc:
+            raise ConfigurationError('base_url is not a valid URL.') from exc
         if parts.scheme not in {'http', 'https'} or not parts.netloc or not parts.hostname:
             raise ConfigurationError(
                 'base_url must be an absolute HTTP(S) URL, for example https://api.example.com/v1'
@@ -66,10 +102,16 @@ class ProviderConfig:
             raise ConfigurationError('timeout must be a finite number greater than zero.')
         if not isinstance(self.name, str):
             raise ConfigurationError('name must be a string.')
+        if _has_control_characters(self.name):
+            raise ConfigurationError('name must not contain control characters.')
         if self.api_key is not None and not isinstance(self.api_key, str):
             raise ConfigurationError('api_key must be a string or None.')
         if self.model is not None and not isinstance(self.model, str):
             raise ConfigurationError('model must be a string or None.')
+        if isinstance(self.model, str) and _has_control_characters(self.model):
+            raise ConfigurationError('model must not contain control characters.')
+        if not isinstance(self.allow_insecure_http, bool):
+            raise ConfigurationError('allow_insecure_http must be a boolean.')
         name = self.name.strip() or 'custom'
         raw_api_key = self.api_key
         api_key = raw_api_key.strip() if isinstance(raw_api_key, str) else raw_api_key
@@ -91,6 +133,21 @@ class ProviderConfig:
             if _has_control_characters(value):
                 raise ConfigurationError(f'Invalid header value for {header_name}.')
             headers[header_name] = header_value
+        uses_credentials = bool(api_key) or any(
+            name.lower() in _SENSITIVE_HEADER_NAMES and bool(value)
+            for name, value in headers.items()
+        )
+        if (
+            parts.scheme == 'http'
+            and not _is_loopback_host(parts.hostname or '')
+            and uses_credentials
+            and not self.allow_insecure_http
+        ):
+            raise ConfigurationError(
+                'HTTP is not allowed for a remote authenticated endpoint because the key '
+                'would be sent in clear text. Use an HTTPS base_url, or pass '
+                '--allow-insecure-http only in an authorized development environment.'
+            )
         object.__setattr__(self, 'base_url', base_url)
         object.__setattr__(self, 'name', name)
         object.__setattr__(self, 'api_key', api_key or None)
@@ -100,7 +157,26 @@ class ProviderConfig:
 
     @property
     def auth_configured(self) -> bool:
-        return bool(self.api_key)
+        return bool(self.api_key) or any(
+            name.lower() in _SENSITIVE_HEADER_NAMES and bool(value)
+            for name, value in self.extra_headers.items()
+        )
+
+    @property
+    def sensitive_values(self) -> Tuple[str, ...]:
+        '''Credential values that must never be rendered in a report.'''
+        values = []
+        if self.api_key:
+            values.append(self.api_key)
+        for name, value in self.extra_headers.items():
+            if name.lower() not in _SENSITIVE_HEADER_NAMES or not value:
+                continue
+            values.append(value)
+            if name.lower() in {'authorization', 'proxy-authorization'}:
+                parts = value.split(None, 1)
+                if len(parts) == 2 and parts[1].strip():
+                    values.append(parts[1].strip())
+        return tuple(dict.fromkeys(values))
 
 
 @dataclass(frozen=True)
@@ -113,8 +189,8 @@ class RunSettings:
     def __post_init__(self) -> None:
         if isinstance(self.samples, bool) or not isinstance(self.samples, int):
             raise ConfigurationError('samples must be an integer.')
-        if not 1 <= self.samples <= 10:
-            raise ConfigurationError('samples must be between 1 and 10.')
+        if not 1 <= self.samples <= 20:
+            raise ConfigurationError('samples must be between 1 and 20.')
         if isinstance(self.max_tokens, bool) or not isinstance(self.max_tokens, int):
             raise ConfigurationError('max_tokens must be an integer.')
         if not 1 <= self.max_tokens <= 4096:

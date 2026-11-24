@@ -45,6 +45,8 @@ PRESETS: dict[str, ProviderPreset] = {
 
 def get_preset(key: str) -> Optional[ProviderPreset]:
     '''Look up a provider preset, case-insensitively.'''
+    if not isinstance(key, str):
+        return None
     return PRESETS.get(key.strip().lower())
 
 

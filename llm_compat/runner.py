@@ -26,6 +26,7 @@ class RunOptions:
     max_tokens: int = 128
     only: tuple[str, ...] = ()
     skip: tuple[str, ...] = ()
+    all_checks: bool = False
 
     def settings(self) -> RunSettings:
         return RunSettings(samples=self.samples, max_tokens=self.max_tokens)
@@ -44,10 +45,18 @@ def run_compatibility(
     that authorization from the user before invoking this function.
     '''
     options = options or RunOptions()
-    if not options.authorize:
+    if options.authorize is not True:
         raise AuthorizationRequiredError()
     settings = options.settings()
-    selected = list(checks) if checks is not None else select_checks(options.only, options.skip)
+    selected = (
+        list(checks)
+        if checks is not None
+        else select_checks(
+            options.only,
+            options.skip,
+            include_optional=options.all_checks,
+        )
+    )
     active_provider = provider or build_provider(config)
 
     started_at = utc_now()
@@ -77,4 +86,5 @@ def run_compatibility(
         duration_ms=duration_ms,
         results=results,
         summary=summarize(results),
+        secrets=active_provider.config.sensitive_values,
     )

@@ -41,6 +41,7 @@ def test_config_normalizes_values_and_hides_key() -> None:
         'https://example.com/v1#fragment',
         'https://example.com:not-a-port/v1',
         'https://exa mple.com/v1',
+        'https://[::1/v1',
         'https://example.com/v1\x00',
         'https://example.com/v1\r\n',
     ],
@@ -53,6 +54,13 @@ def test_config_rejects_invalid_base_urls(base_url: str) -> None:
 def test_config_rejects_invalid_timeout() -> None:
     with pytest.raises(ConfigurationError):
         ProviderConfig(base_url='https://example.com/v1', timeout=0)
+
+
+def test_config_rejects_control_characters_in_name_and_model() -> None:
+    with pytest.raises(ConfigurationError):
+        ProviderConfig(base_url='https://example.com/v1', name='bad\nname')
+    with pytest.raises(ConfigurationError):
+        ProviderConfig(base_url='https://example.com/v1', model='bad\nmodel')
 
 
 def test_config_rejects_header_injection() -> None:
@@ -111,12 +119,24 @@ def test_config_rejects_line_breaks_in_api_key() -> None:
 
 @pytest.mark.parametrize(
     ('samples', 'max_tokens'),
-    [(0, 128), (11, 128), (3, 0), (3, 4097)],
+    [(0, 128), (21, 128), (3, 0), (3, 4097)],
 )
 def test_run_settings_bounds(samples: int, max_tokens: int) -> None:
     with pytest.raises(ConfigurationError):
         RunSettings(samples=samples, max_tokens=max_tokens)
 
+
+def test_run_settings_accepts_twenty_samples() -> None:
+    settings = RunSettings(samples=20)
+    assert settings.samples == 20
+
+
+def test_empty_sensitive_header_is_not_a_credential() -> None:
+    config = ProviderConfig(
+        base_url='http://example.com/v1',
+        extra_headers={'Authorization': ''},
+    )
+    assert config.auth_configured is False
 
 
 def test_redirect_errors_explain_the_same_origin_policy() -> None:

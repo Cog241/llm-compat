@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import socket
 from typing import Any
 
@@ -51,6 +52,18 @@ def test_invalid_request_headers_are_reported_as_network_errors() -> None:
     assert 'secret-value' not in str(captured.value)
 
 
+def test_invalid_custom_secret_header_is_redacted() -> None:
+    with pytest.raises(NetworkError) as captured:
+        UrllibHttpClient().send(
+            HttpRequest(
+                method='GET',
+                url='https://example.com/v1/models',
+                headers={'X-Api-Key': 'custom-secret-value\nbad'},
+            )
+        )
+    assert 'custom-secret-value' not in str(captured.value)
+
+
 def test_http_client_returns_error_status_without_raising(mock_server: MockAPIServer) -> None:
     mock_server.api_key = 'secret'
     response = UrllibHttpClient().send(
@@ -93,6 +106,36 @@ def test_cross_origin_redirect_is_not_followed(
             provider.list_models()
         assert captured.value.status_code == 302
         assert 'scheme, host, and port' in (captured.value.hint or '')
+        assert target.requests == []
+
+
+def test_same_origin_relative_redirect_is_followed(
+    mock_server: MockAPIServer,
+    config_factory: Any,
+) -> None:
+    mock_server.redirect_to = 'models'
+    mock_server.redirect_once = True
+    provider = OpenAICompatibleProvider(config_factory())
+
+    models = provider.list_models()
+
+    assert models
+    assert len(mock_server.requests) == 2
+
+
+def test_redirect_with_embedded_credentials_is_not_followed(
+    mock_server: MockAPIServer,
+    config_factory: Any,
+) -> None:
+    with MockAPIServer() as target:
+        mock_server.redirect_to = target.base_url.replace(
+            'http://', 'http://user:password@'
+        ) + '/models'
+        provider = OpenAICompatibleProvider(config_factory())
+        with pytest.raises(HTTPStatusError) as captured:
+            provider.list_models()
+        assert captured.value.status_code == 302
+        assert 'password' not in captured.value.message
         assert target.requests == []
 
 
@@ -246,6 +289,26 @@ def test_chat_parser_handles_content_parts_and_derives_usage() -> None:
     assert response.latency_ms == 12.5
 
 
+def test_chat_parser_rejects_malformed_content_parts() -> None:
+    with pytest.raises(ProtocolError):
+        _parser_provider()._parse_chat(
+            {
+                'choices': [
+                    {'message': {'content': [{'type': 'text', 'text': 'ok'}, 42]}}
+                ]
+            },
+            latency_ms=1.0,
+        )
+
+
+def test_chat_parser_rejects_invalid_content_type() -> None:
+    with pytest.raises(ProtocolError):
+        _parser_provider()._parse_chat(
+            {'choices': [{'message': {'content': 42}}]},
+            latency_ms=1.0,
+        )
+
+
 def test_chat_parser_supports_legacy_function_call() -> None:
     response = _parser_provider()._parse_chat(
         {
@@ -298,6 +361,52 @@ def test_tool_call_parser_serializes_object_arguments() -> None:
     )
     assert calls[0].id == 'call-1'
     assert calls[0].arguments == '{"query": "x"}'
+
+
+@pytest.mark.parametrize(
+    'message',
+    [
+        {'tool_calls': 'not-an-array'},
+        {'tool_calls': ['not-an-object']},
+        {'tool_calls': [{}]},
+        {'tool_calls': [{'function': {'name': 3}}]},
+        {'tool_calls': [{'function': {'name': 'lookup', 'arguments': 3}}]},
+        {'tool_calls': [{'id': 3, 'function': {'name': 'lookup'}}]},
+        {'function_call': 'not-an-object'},
+        {'function_call': {'name': 3}},
+        {'function_call': {'name': 'lookup', 'arguments': 3}},
+    ],
+)
+def test_tool_call_parser_rejects_malformed_shapes(message: Any) -> None:
+    with pytest.raises(ProtocolError):
+        _parse_tool_calls(message)
+
+
+@pytest.mark.parametrize(
+    'delta',
+    [
+        {'tool_calls': 'not-an-array'},
+        {'tool_calls': ['not-an-object']},
+        {'tool_calls': [{'function': {'name': 3}}]},
+        {'tool_calls': [{'function': {'name': 'lookup', 'arguments': 3}}]},
+        {'tool_calls': [{'id': 3, 'function': {'name': 'lookup'}}]},
+        {'function_call': 'not-an-object'},
+        {'function_call': {'name': 3}},
+        {'function_call': {'name': 'lookup', 'arguments': 3}},
+    ],
+)
+def test_stream_parser_rejects_malformed_tool_deltas(delta: Any) -> None:
+    chunk = json.dumps({'choices': [{'delta': delta}]}).encode('utf-8')
+    response = HttpResponse(200, {}, body=b'data: ' + chunk + b'\n\n')
+    with pytest.raises(ProtocolError):
+        list(_parser_provider()._read_stream(response))
+
+
+def test_stream_parser_rejects_non_object_delta() -> None:
+    chunk = json.dumps({'choices': [{'delta': 'not-an-object'}]}).encode('utf-8')
+    response = HttpResponse(200, {}, body=b'data: ' + chunk + b'\n\n')
+    with pytest.raises(ProtocolError):
+        list(_parser_provider()._read_stream(response))
 
 
 def test_usage_parser_ignores_booleans() -> None:

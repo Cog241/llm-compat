@@ -6,8 +6,7 @@ import time
 
 from llm_compat.checks.base import CheckContext, CompatibilityCheck, error_info
 from llm_compat.errors import HTTPStatusError, ProtocolError
-from llm_compat.results import CheckResult, Status
-from llm_compat.utils import truncate
+from llm_compat.results import CheckResult, FailureKind, Status
 
 
 class ConnectivityCheck(CompatibilityCheck):
@@ -43,8 +42,12 @@ class ConnectivityCheck(CompatibilityCheck):
         except ProtocolError as exc:
             return self.result(
                 Status.WARN,
-                f'Endpoint reachable, but /models did not return valid OpenAI JSON: {exc}',
+                context.redact(
+                    f'Endpoint reachable, but /models did not return valid OpenAI JSON: {exc}',
+                    500,
+                ),
                 details={'status_code': 200},
+                failure_kind=FailureKind.MALFORMED,
             )
 
 
@@ -59,27 +62,41 @@ class AuthenticationCheck(CompatibilityCheck):
             context.provider.list_models()
         except HTTPStatusError as exc:
             if exc.status_code in {401, 403}:
-                detail = truncate(' '.join(exc.message.split()), 160)
+                detail = context.redact(exc.message, 160)
                 suffix = f': {detail}' if detail else ''
                 return self.result(
                     Status.FAIL,
                     f'Authentication failed with HTTP {exc.status_code}{suffix}',
                     details={'status_code': exc.status_code},
-                    error=error_info(exc),
+                    error=error_info(
+                        exc,
+                        failure_kind=FailureKind.AUTHENTICATION,
+                        secrets=context.provider.config.sensitive_values,
+                    ),
+                    failure_kind=FailureKind.AUTHENTICATION,
                 )
             if exc.status_code == 404:
                 return self.result(
                     Status.WARN,
                     'Authentication could not be verified because /models returned HTTP 404.',
                     details={'status_code': 404},
-                    error=error_info(exc),
+                    error=error_info(
+                        exc,
+                        failure_kind=FailureKind.UNSUPPORTED,
+                        secrets=context.provider.config.sensitive_values,
+                    ),
+                    failure_kind=FailureKind.UNSUPPORTED,
                 )
             raise
         except ProtocolError as exc:
             return self.result(
                 Status.WARN,
-                f'The request was accepted, but /models could not be parsed: {exc}',
+                context.redact(
+                    f'The request was accepted, but /models could not be parsed: {exc}',
+                    500,
+                ),
                 details={'status_code': 200},
+                failure_kind=FailureKind.MALFORMED,
             )
         if context.provider.auth_configured:
             message = 'API key accepted by the endpoint.'

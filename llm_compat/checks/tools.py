@@ -1,43 +1,49 @@
-'''Tool-calling compatibility check.'''
+'''Tool-calling compatibility check, including the result round trip.'''
 
 from __future__ import annotations
 
-import json
+from typing import Any
 
+from llm_compat.checks._tooling import (
+    WEATHER_TOOL,
+    call_as_message,
+    call_preview,
+    tool_result_message,
+    validate_weather_call,
+)
 from llm_compat.checks.base import CheckContext, CompatibilityCheck
-from llm_compat.results import CheckResult, Status
-from llm_compat.utils import truncate
+from llm_compat.providers.base import ChatResponse
+from llm_compat.results import CheckResult, FailureKind, Status
 
-_WEATHER_TOOL = {
-    'type': 'function',
-    'function': {
-        'name': 'get_weather',
-        'description': 'Get the current weather for a city.',
-        'parameters': {
-            'type': 'object',
-            'properties': {
-                'city': {
-                    'type': 'string',
-                    'description': 'City name, for example Paris.',
-                }
-            },
-            'required': ['city'],
-            'additionalProperties': False,
-        },
-    },
-}
+
+def _response_details(context: CheckContext, response: ChatResponse) -> dict[str, Any]:
+    return {
+        'finish_reason': response.finish_reason,
+        'content_preview': context.redact(response.content, 200),
+        'tool_calls': [
+            call_preview(
+                call,
+                secrets=context.provider.config.sensitive_values,
+            )
+            for call in response.tool_calls
+        ],
+        'usage': response.usage.to_dict(),
+        'latency_ms': round(response.latency_ms, 2),
+    }
 
 
 class ToolCallingCheck(CompatibilityCheck):
     id = 'tools'
-    name = 'Tool calling'
+    name = 'Tool calling (multi-turn)'
     category = 'tools'
-    description = 'Request a tool call and validate the function name and JSON arguments.'
+    description = (
+        'Request a tool call, return its result, and validate the follow-up answer.'
+    )
     requires_model = True
 
     def run(self, context: CheckContext) -> CheckResult:
         assert context.model is not None
-        response = context.provider.chat(
+        first = context.provider.chat(
             model=context.model,
             messages=[
                 {
@@ -47,61 +53,90 @@ class ToolCallingCheck(CompatibilityCheck):
             ],
             max_tokens=min(context.settings.max_tokens, 128),
             temperature=0.0,
-            tools=[_WEATHER_TOOL],
+            tools=[WEATHER_TOOL],
             tool_choice='auto',
         )
-        calls = response.tool_calls
-        details = {
-            'finish_reason': response.finish_reason,
-            'content_preview': truncate(response.content, 200),
-            'tool_calls': [
-                {'name': call.name, 'arguments': truncate(call.arguments, 300)} for call in calls
-            ],
-            'usage': response.usage.to_dict(),
-            'latency_ms': round(response.latency_ms, 2),
-        }
+        details = _response_details(context, first)
+        calls = first.tool_calls
         if not calls:
             return self.result(
                 Status.FAIL,
                 'The model did not return a tool call even though the request asked for one.',
                 details=details,
+                failure_kind=FailureKind.MODEL_BEHAVIOR,
             )
-        call = next((candidate for candidate in calls if candidate.name == 'get_weather'), calls[0])
-        if call.name != 'get_weather':
+        call = next(
+            (candidate for candidate in calls if candidate.name == 'get_weather'), calls[0]
+        )
+        failure = validate_weather_call(call)
+        if failure:
             return self.result(
                 Status.FAIL,
-                f'The model called {call.name or "an unnamed function"} instead of get_weather.',
+                failure,
                 details=details,
+                failure_kind=FailureKind.MODEL_BEHAVIOR,
             )
-        if not call.id or not call.id.strip():
+
+        tool_result = {
+            'city': 'Paris',
+            'temperature_c': 18,
+            'condition': 'sunny',
+            'marker': 'TOOL_RESULT_18C',
+        }
+        assistant_message = {
+            'role': 'assistant',
+            'content': first.content or None,
+            'tool_calls': [call_as_message(call)],
+        }
+        tool_messages = [tool_result_message(call, tool_result)]
+        follow_up = context.provider.chat(
+            model=context.model,
+            messages=[
+                {
+                    'role': 'user',
+                    'content': 'Use the get_weather tool to get the current weather in Paris.',
+                },
+                assistant_message,
+                *tool_messages,
+                {
+                    'role': 'user',
+                    'content': (
+                        'Use the tool result to answer. Include the exact marker '
+                        'TOOL_RESULT_18C and do not call any more tools.'
+                    ),
+                },
+            ],
+            max_tokens=min(context.settings.max_tokens, 128),
+            temperature=0.0,
+            tools=[WEATHER_TOOL],
+            tool_choice='auto',
+        )
+        details['follow_up'] = _response_details(context, follow_up)
+        details['tool_result'] = tool_result
+        if follow_up.tool_calls:
             return self.result(
                 Status.FAIL,
-                'The tool call did not include a usable id for a follow-up tool result.',
+                'The model requested another tool instead of using the returned tool result.',
                 details=details,
+                failure_kind=FailureKind.MODEL_BEHAVIOR,
             )
-        try:
-            arguments = json.loads(call.arguments) if call.arguments else {}
-        except (json.JSONDecodeError, ValueError):
+        content = follow_up.content.strip()
+        if not content:
             return self.result(
                 Status.FAIL,
-                'The tool call arguments were not valid JSON.',
+                'The follow-up response contained no text after the tool result was returned.',
                 details=details,
+                failure_kind=FailureKind.MODEL_BEHAVIOR,
             )
-        if not isinstance(arguments, dict):
+        if 'TOOL_RESULT_18C' not in content:
             return self.result(
                 Status.FAIL,
-                'The tool call arguments were not a JSON object.',
+                'The follow-up response did not use the returned tool result marker.',
                 details=details,
-            )
-        city = arguments.get('city')
-        if not isinstance(city, str) or not city.strip():
-            return self.result(
-                Status.FAIL,
-                'The tool call arguments did not contain a city string.',
-                details=details,
+                failure_kind=FailureKind.MODEL_BEHAVIOR,
             )
         return self.result(
             Status.PASS,
-            'Returned get_weather with valid JSON arguments.',
+            'Completed a get_weather round trip and used the returned tool result.',
             details=details,
         )

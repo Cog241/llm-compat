@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from llm_compat.results import CheckResult, Status, Summary
-from llm_compat.utils import safe_url, truncate
+from llm_compat.utils import redact_sensitive, redact_value, safe_url, truncate
 from llm_compat.version import __version__
 
 _COLORS = {
@@ -36,14 +36,15 @@ class CompatibilityReport:
     results: tuple[CheckResult, ...]
     summary: Summary
     schema_version: str = '1.0'
+    secrets: tuple[str, ...] = field(default=(), repr=False)
 
     @property
     def display_base_url(self) -> str:
         return safe_url(self.base_url)
 
     def to_dict(self) -> dict[str, object]:
-        '''Return a JSON-safe export with no credentials.'''
-        return {
+        '''Return a JSON-safe export with credentials redacted centrally.'''
+        payload = {
             'schema_version': self.schema_version,
             'tool': {'name': 'llm-compat', 'version': __version__},
             'provider': {
@@ -61,6 +62,7 @@ class CompatibilityReport:
             'summary': self.summary.to_dict(),
             'results': [result.to_dict() for result in self.results],
         }
+        return redact_value(payload, self.secrets)
 
 
 def _format_duration(duration_ms: float) -> str:
@@ -77,15 +79,16 @@ def _paint(text: str, status: Status, enabled: bool) -> str:
 
 def render_text(report: CompatibilityReport, *, color: bool = False) -> str:
     '''Render a compact, human-readable report for a terminal.'''
-    provider_name = truncate(report.provider_name, 120)
-    base_url = truncate(report.display_base_url, 300)
+    secrets = report.secrets
+    provider_name = truncate(redact_sensitive(report.provider_name, secrets), 120)
+    base_url = truncate(redact_sensitive(report.display_base_url, secrets), 300)
     lines = [
         f'LLM Compat {__version__}',
         f'Provider: {provider_name}  {base_url}',
     ]
     if report.model:
         suffix = ' (auto-selected)' if report.model_source == 'auto' else ''
-        lines.append(f'Model: {truncate(report.model, 200)}{suffix}')
+        lines.append(f'Model: {truncate(redact_sensitive(report.model, secrets), 200)}{suffix}')
     else:
         lines.append('Model: (not selected)')
     lines.append(f'API key: {"configured" if report.auth_configured else "not configured"}')
@@ -93,7 +96,7 @@ def render_text(report: CompatibilityReport, *, color: bool = False) -> str:
     lines.append('')
     lines.append('Checks')
 
-    names = [truncate(item.name, 40) for item in report.results]
+    names = [truncate(redact_sensitive(item.name, secrets), 40) for item in report.results]
     name_width = max(24, min(40, max((len(name) for name in names), default=0)))
     for item, name in zip(report.results, names):
         label = f'{item.status.label:<5}'
@@ -104,11 +107,14 @@ def render_text(report: CompatibilityReport, *, color: bool = False) -> str:
         )
         indent = ' ' * (11 + name_width)
         available = max(40, 100 - len(indent))
-        message = truncate(item.message, 1000)
+        message = truncate(redact_sensitive(item.message, secrets), 1000)
         for wrapped in textwrap.wrap(message, width=available) or ['']:
             lines.append(f'{indent}{wrapped}')
+        if item.failure_kind is not None:
+            lines.append(f'{indent}Failure class: {item.failure_kind.value}')
         if item.error and item.error.hint:
-            lines.append(f'{indent}Hint: {truncate(item.error.hint, 500)}')
+            hint = truncate(redact_sensitive(item.error.hint, secrets), 500)
+            lines.append(f'{indent}Hint: {hint}')
 
     lines.append('')
     lines.append('Summary')
@@ -128,6 +134,11 @@ def render_text(report: CompatibilityReport, *, color: bool = False) -> str:
         f"{errors} error{'s' if errors != 1 else ''}, "
         f"{counts.get('skip', 0)} skipped"
     )
+    if report.summary.failure_kinds:
+        classes = ', '.join(
+            f'{name}={count}' for name, count in sorted(report.summary.failure_kinds.items())
+        )
+        lines.append(f'  Failure classes: {classes}')
     return '\n'.join(lines)
 
 

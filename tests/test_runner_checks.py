@@ -58,6 +58,15 @@ def test_authorization_is_required_before_any_request(
     assert mock_server.requests == []
 
 
+def test_non_boolean_authorization_is_rejected(
+    mock_server: MockAPIServer,
+    config_factory: Any,
+) -> None:
+    with pytest.raises(AuthorizationRequiredError):
+        run_compatibility(config_factory(), RunOptions(authorize=1))
+    assert mock_server.requests == []
+
+
 def test_model_is_auto_selected_from_discovery(
     mock_server: MockAPIServer,
     config_factory: Any,

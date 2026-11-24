@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from llm_compat.checks.base import CheckContext, CompatibilityCheck, error_info
 from llm_compat.errors import HTTPStatusError
-from llm_compat.results import CheckResult, Status
+from llm_compat.results import CheckResult, FailureKind, Status
 
 
 class ModelDiscoveryCheck(CompatibilityCheck):
@@ -22,7 +22,12 @@ class ModelDiscoveryCheck(CompatibilityCheck):
                     Status.FAIL,
                     'Model discovery is not available: /models returned HTTP 404.',
                     details={'status_code': 404},
-                    error=error_info(exc),
+                    error=error_info(
+                        exc,
+                        failure_kind=FailureKind.UNSUPPORTED,
+                        secrets=context.provider.config.sensitive_values,
+                    ),
+                    failure_kind=FailureKind.UNSUPPORTED,
                 )
             raise
         if not models:
@@ -30,6 +35,7 @@ class ModelDiscoveryCheck(CompatibilityCheck):
                 Status.FAIL,
                 'The endpoint returned an empty model list.',
                 details={'count': 0, 'models': []},
+                failure_kind=FailureKind.UNSUPPORTED,
             )
         identifiers = [model.id for model in models]
         sample = identifiers[:50]

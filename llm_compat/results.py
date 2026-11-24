@@ -25,6 +25,22 @@ class Status(str, Enum):
         return self in {Status.FAIL, Status.ERROR}
 
 
+class FailureKind(str, Enum):
+    '''Why a check did not simply pass.
+
+    The check status says how severe the result is; this classification says
+    what kind of incompatibility or run problem was observed.
+    '''
+
+    UNSUPPORTED = 'unsupported'
+    MALFORMED = 'malformed'
+    MODEL_BEHAVIOR = 'model_behavior'
+    AUTHENTICATION = 'authentication'
+    TEMPORARY = 'temporary'
+    CONFIGURATION = 'configuration'
+    UNKNOWN = 'unknown'
+
+
 @dataclass(frozen=True)
 class ErrorInfo:
     '''Machine-readable details for a check that could not complete cleanly.'''
@@ -35,6 +51,7 @@ class ErrorInfo:
     status_code: Optional[int] = None
     retryable: bool = False
     hint: Optional[str] = None
+    failure_kind: Optional[FailureKind] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -44,6 +61,7 @@ class ErrorInfo:
             'status_code': self.status_code,
             'retryable': self.retryable,
             'hint': self.hint,
+            'failure_kind': self.failure_kind.value if self.failure_kind else None,
         }
 
 
@@ -59,6 +77,7 @@ class CheckResult:
     duration_ms: float = 0.0
     details: dict[str, Any] = field(default_factory=dict)
     error: Optional[ErrorInfo] = None
+    failure_kind: Optional[FailureKind] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +85,7 @@ class CheckResult:
             'name': self.name,
             'category': self.category,
             'status': self.status.value,
+            'failure_kind': self.failure_kind.value if self.failure_kind else None,
             'message': self.message,
             'duration_ms': round(self.duration_ms, 2),
             'details': self.details,
@@ -82,6 +102,7 @@ class Summary:
     executed: int
     score: float
     verdict: str
+    failure_kinds: Mapping[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -90,14 +111,19 @@ class Summary:
             'total_checks': self.total,
             'executed_checks': self.executed,
             'counts': dict(self.counts),
+            'failure_kinds': dict(self.failure_kinds),
         }
 
 
 def summarize(results: list[CheckResult] | tuple[CheckResult, ...]) -> Summary:
     '''Count statuses and derive a pass rate and verdict.'''
     counts = {status.value: 0 for status in Status}
+    failure_kinds: dict[str, int] = {}
     for result in results:
         counts[result.status.value] += 1
+        if result.failure_kind is not None:
+            key = result.failure_kind.value
+            failure_kinds[key] = failure_kinds.get(key, 0) + 1
     total = len(results)
     skipped = counts[Status.SKIP.value]
     executed = total - skipped
@@ -119,4 +145,5 @@ def summarize(results: list[CheckResult] | tuple[CheckResult, ...]) -> Summary:
         executed=executed,
         score=score,
         verdict=verdict,
+        failure_kinds=failure_kinds,
     )

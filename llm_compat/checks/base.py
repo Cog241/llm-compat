@@ -16,8 +16,8 @@ from llm_compat.errors import (
     ProtocolError,
 )
 from llm_compat.providers.base import Provider
-from llm_compat.results import CheckResult, ErrorInfo, Status
-from llm_compat.utils import truncate
+from llm_compat.results import CheckResult, ErrorInfo, FailureKind, Status
+from llm_compat.utils import redact_sensitive, truncate
 
 
 @dataclass(frozen=True)
@@ -28,19 +28,51 @@ class CheckContext:
     model: Optional[str]
     settings: RunSettings
 
+    def redact(self, value: Any, limit: int = 400) -> str:
+        '''Sanitize a response preview before it reaches a report.'''
+        return truncate(redact_sensitive(str(value), self.provider.config.sensitive_values), limit)
 
-def error_info(exc: BaseException) -> ErrorInfo:
-    '''Build a stable, JSON-safe error description.'''
+
+def failure_kind_for_exception(exc: BaseException) -> FailureKind:
+    '''Explain why an exception prevented a clean compatibility check.'''
+    if isinstance(exc, HTTPStatusError):
+        if exc.status_code in {401, 403}:
+            return FailureKind.AUTHENTICATION
+        if exc.status_code in {408, 425, 429} or exc.status_code >= 500:
+            return FailureKind.TEMPORARY
+        if exc.status_code in {400, 404, 405, 406, 409, 415, 422}:
+            return FailureKind.UNSUPPORTED
+        return FailureKind.UNKNOWN
+    if isinstance(exc, ProtocolError):
+        return FailureKind.MALFORMED
+    if isinstance(exc, NetworkError):
+        return FailureKind.TEMPORARY
+    if isinstance(exc, ConfigurationError):
+        return FailureKind.CONFIGURATION
+    return FailureKind.UNKNOWN
+
+
+def error_info(
+    exc: BaseException,
+    *,
+    failure_kind: Optional[FailureKind] = None,
+    secrets: tuple[str, ...] = (),
+) -> ErrorInfo:
+    '''Build a stable, JSON-safe, redacted error description.'''
     hint = getattr(exc, 'hint', None)
     if not isinstance(exc, LLMCompatError):
         hint = 'This is likely an LLM Compat defect. Re-run and report it if the problem persists.'
+    hint_text = str(hint) if hint else None
     return ErrorInfo(
         type=type(exc).__name__,
-        kind=getattr(exc, 'kind', 'internal'),
-        message=truncate(str(exc), 1000) or type(exc).__name__,
+        kind=str(getattr(exc, 'kind', 'internal')),
+        message=truncate(redact_sensitive(str(exc), secrets), 1000) or type(exc).__name__,
         status_code=getattr(exc, 'status_code', None),
         retryable=bool(getattr(exc, 'retryable', False)),
-        hint=truncate(hint, 500) if hint else None,
+        hint=(
+            truncate(redact_sensitive(hint_text, secrets), 500) if hint_text else None
+        ),
+        failure_kind=failure_kind,
     )
 
 
@@ -65,6 +97,7 @@ class CompatibilityCheck(ABC):
     category: ClassVar[str]
     description: ClassVar[str]
     requires_model: ClassVar[bool] = False
+    default_enabled: ClassVar[bool] = True
 
     @abstractmethod
     def run(self, context: CheckContext) -> CheckResult:
@@ -77,6 +110,7 @@ class CompatibilityCheck(ABC):
         *,
         details: Optional[dict[str, Any]] = None,
         error: Optional[ErrorInfo] = None,
+        failure_kind: Optional[FailureKind] = None,
     ) -> CheckResult:
         return CheckResult(
             id=self.id,
@@ -86,6 +120,7 @@ class CompatibilityCheck(ABC):
             message=message,
             details=details or {},
             error=error,
+            failure_kind=failure_kind,
         )
 
     def execute(self, context: CheckContext) -> CheckResult:
@@ -99,7 +134,12 @@ class CompatibilityCheck(ABC):
         try:
             result = self.run(context)
         except Exception as exc:  # noqa: BLE001 - converted into a report entry
-            info = error_info(exc)
+            failure_kind = failure_kind_for_exception(exc)
+            info = error_info(
+                exc,
+                failure_kind=failure_kind,
+                secrets=context.provider.config.sensitive_values,
+            )
             if isinstance(exc, ProtocolError):
                 message = f'Compatibility failure: {exc}'
             elif isinstance(exc, HTTPStatusError):
@@ -110,11 +150,15 @@ class CompatibilityCheck(ABC):
                 message = f'Run error: {exc}'
             else:
                 message = f'Unexpected {type(exc).__name__} while running the check.'
+            message = truncate(
+                redact_sensitive(message, context.provider.config.sensitive_values), 1000
+            )
             result = self.result(
                 status_for_exception(exc),
                 message,
                 details={'error_type': type(exc).__name__},
                 error=info,
+                failure_kind=failure_kind,
             )
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
         return replace(result, duration_ms=elapsed_ms)

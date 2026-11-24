@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from llm_compat.checks.base import CheckContext, CompatibilityCheck
-from llm_compat.results import CheckResult, Status
-from llm_compat.utils import truncate
+from llm_compat.results import CheckResult, FailureKind, Status
 
 
 class ChatCompletionCheck(CompatibilityCheck):
@@ -26,7 +25,7 @@ class ChatCompletionCheck(CompatibilityCheck):
         details = {
             'response_model': response.model or context.model,
             'finish_reason': response.finish_reason,
-            'content_preview': truncate(content, 200),
+            'content_preview': context.redact(content, 200),
             'usage': response.usage.to_dict(),
             'latency_ms': round(response.latency_ms, 2),
         }
@@ -35,6 +34,7 @@ class ChatCompletionCheck(CompatibilityCheck):
                 Status.FAIL,
                 'The completion response contained no text content.',
                 details=details,
+                failure_kind=FailureKind.MODEL_BEHAVIOR,
             )
         return self.result(
             Status.PASS,

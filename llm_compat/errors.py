@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
-from llm_compat.utils import redact_secret, safe_url, truncate
+from llm_compat.utils import redact_sensitive, safe_url, truncate
 
 _STATUS_HINTS = {
     400: (
@@ -19,6 +19,8 @@ _STATUS_HINTS = {
         'and that the endpoint exists.'
     ),
     405: 'The endpoint does not allow this HTTP method.',
+    408: 'The provider timed out waiting for the request. Retry later.',
+    425: 'The provider refused an early request. Retry later.',
     429: 'The provider rate-limited the request. Retry later or reduce request volume.',
     500: 'The provider reported a server error. Retry later.',
     502: 'The provider or an upstream service returned a bad gateway response. Retry later.',
@@ -127,7 +129,7 @@ class HTTPStatusError(LLMCompatError):
 
     @property
     def retryable(self) -> bool:
-        return self.status_code == 429 or self.status_code >= 500
+        return self.status_code in {408, 425, 429} or self.status_code >= 500
 
 
 def _extract_error_message(body: str) -> Optional[str]:
@@ -136,18 +138,18 @@ def _extract_error_message(body: str) -> Optional[str]:
         return None
     try:
         payload = json.loads(body)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(payload, dict):
         return None
     error = payload.get('error')
     if isinstance(error, dict):
         message = error.get('message') or error.get('code')
-        return truncate(str(message)) if message else None
+        return str(message) if message else None
     if isinstance(error, str):
-        return truncate(error)
+        return error
     message = payload.get('message')
-    return truncate(str(message)) if message else None
+    return str(message) if message else None
 
 
 def build_http_error(
@@ -156,10 +158,14 @@ def build_http_error(
     body: str,
     *,
     secret: Optional[str] = None,
+    secrets: Sequence[str] = (),
     retry_after: Optional[str] = None,
 ) -> HTTPStatusError:
     '''Create a redacted and user-friendly error for an HTTP failure.'''
+    known_secrets = tuple(secrets) + ((secret,) if secret else ())
     detail = _extract_error_message(body)
+    if detail is not None:
+        detail = truncate(redact_sensitive(detail, known_secrets), 400)
     if detail is None:
         if status_code == 401:
             detail = 'Authentication failed.'
@@ -175,7 +181,9 @@ def build_http_error(
             detail = 'The provider returned a server error.'
         else:
             detail = 'The provider returned an error response.'
-    message = redact_secret(f'HTTP {status_code} from {safe_url(url)}: {detail}', secret)
+    message = redact_sensitive(
+        f'HTTP {status_code} from {safe_url(url)}: {detail}', known_secrets
+    )
     parsed_retry_after: Optional[int] = None
     if retry_after:
         try:
@@ -188,7 +196,7 @@ def build_http_error(
     return HTTPStatusError(
         status_code,
         message,
-        body=redact_secret(truncate(body, 2000), secret),
+        body=truncate(redact_sensitive(body, known_secrets), 2000),
         retry_after=parsed_retry_after,
         hint=hint,
     )

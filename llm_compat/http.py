@@ -8,11 +8,11 @@ from dataclasses import dataclass, field
 from http.client import HTTPException
 from typing import IO, Any, Iterator, Mapping, Optional, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from llm_compat.errors import NetworkError, ProtocolError
-from llm_compat.utils import redact_secret, safe_url
+from llm_compat.utils import redact_sensitive, safe_url
 
 
 @dataclass(frozen=True)
@@ -37,10 +37,12 @@ class HttpResponse:
         body: Optional[bytes] = None,
         raw: Optional[IO[bytes]] = None,
         url: str = '',
+        secrets: tuple[str, ...] = (),
     ) -> None:
         self.status_code = status_code
         self.headers = {str(key).lower(): str(value) for key, value in headers.items()}
         self.url = url
+        self.secrets = tuple(secrets)
         self._body = body
         self._raw = raw
 
@@ -52,8 +54,9 @@ class HttpResponse:
             try:
                 self._body = self._raw.read()
             except (OSError, ValueError, HTTPException) as exc:
+                detail = redact_sensitive(str(exc), self.secrets)
                 raise NetworkError(
-                    f'Could not read the response from {safe_url(self.url)}: {exc}'
+                    f'Could not read the response from {safe_url(self.url)}: {detail}'
                 ) from exc
             finally:
                 self.close()
@@ -62,7 +65,7 @@ class HttpResponse:
     def json(self) -> Any:
         try:
             return json.loads(self.text)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
             raise ProtocolError(
                 f'Expected JSON from {safe_url(self.url) or "the endpoint"} '
                 'but received non-JSON content.'
@@ -79,8 +82,9 @@ class HttpResponse:
             for line in self._raw:
                 yield line.decode('utf-8', errors='replace').rstrip('\r\n')
         except (OSError, ValueError, HTTPException) as exc:
+            detail = redact_sensitive(str(exc), self.secrets)
             raise NetworkError(
-                f'Could not read the stream from {safe_url(self.url)}: {exc}'
+                f'Could not read the stream from {safe_url(self.url)}: {detail}'
             ) from exc
 
     def close(self) -> None:
@@ -106,15 +110,26 @@ class HttpClient(Protocol):
         ...
 
 
+def _origin(parts: Any) -> tuple[str, str, Optional[int]]:
+    scheme = parts.scheme.lower()
+    port = parts.port
+    if port is None:
+        port = {'http': 80, 'https': 443}.get(scheme)
+    return scheme, (parts.hostname or '').lower(), port
+
+
 class _SameOriginRedirectHandler(HTTPRedirectHandler):
     '''Follow redirects only when scheme, host, and port are unchanged.'''
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        old = urlsplit(req.full_url)
-        new = urlsplit(newurl)
         try:
-            old_origin = (old.scheme.lower(), (old.hostname or '').lower(), old.port)
-            new_origin = (new.scheme.lower(), (new.hostname or '').lower(), new.port)
+            old = urlsplit(req.full_url)
+            newurl = urljoin(req.full_url, newurl)
+            new = urlsplit(newurl)
+            if new.username is not None or new.password is not None:
+                return None
+            old_origin = _origin(old)
+            new_origin = _origin(new)
         except ValueError:
             return None
         if old_origin != new_origin:
@@ -129,7 +144,15 @@ class UrllibHttpClient:
     '''Default transport. It uses TLS verification by default.'''
 
     def send(self, request: HttpRequest) -> HttpResponse:
-        secret = None
+        secrets = []
+        for value in request.headers.values():
+            raw = str(value)
+            if not raw or len(raw) < 4:
+                continue
+            secrets.append(raw)
+            escaped = raw.encode('unicode_escape').decode('ascii')
+            if escaped != raw:
+                secrets.append(escaped)
         for name, value in request.headers.items():
             if (
                 isinstance(name, str)
@@ -137,7 +160,7 @@ class UrllibHttpClient:
                 and isinstance(value, str)
                 and value.lower().startswith('bearer ')
             ):
-                secret = value[7:]
+                secrets.append(value[7:])
                 break
         try:
             http_request = Request(
@@ -151,23 +174,23 @@ class UrllibHttpClient:
             body = b''
             try:
                 body = exc.read()
-            except (OSError, ValueError):
+            except (OSError, ValueError, HTTPException):
                 pass
             finally:
                 exc.close()
             return HttpResponse(
                 exc.code,
-                dict(exc.headers.items()),
+                dict(exc.headers.items()) if exc.headers else {},
                 body=body,
                 url=request.url,
             )
         except (URLError, socket.timeout, TimeoutError, OSError) as exc:
-            reason = redact_secret(str(getattr(exc, 'reason', exc)), secret)
+            reason = redact_sensitive(str(getattr(exc, 'reason', exc)), secrets)
             raise NetworkError(
                 f'Could not reach {safe_url(request.url)}: {reason}.'
             ) from exc
         except (ValueError, TypeError, HTTPException) as exc:
-            detail = redact_secret(str(exc), secret)
+            detail = redact_sensitive(str(exc), secrets)
             raise NetworkError(
                 f'Could not send the request to {safe_url(request.url)}: {detail}'
             ) from exc

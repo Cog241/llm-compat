@@ -20,7 +20,7 @@ from llm_compat.providers.base import (
     ToolDefinition,
     Usage,
 )
-from llm_compat.utils import redact_secret, safe_url, truncate
+from llm_compat.utils import redact_sensitive, safe_url, truncate
 from llm_compat.version import __version__
 
 
@@ -33,14 +33,25 @@ def _content_text(content: Any) -> str:
         for part in content:
             if isinstance(part, str):
                 parts.append(part)
-            elif isinstance(part, dict):
-                text = part.get('text')
-                if isinstance(text, str):
-                    parts.append(text)
-                elif isinstance(text, dict) and isinstance(text.get('value'), str):
-                    parts.append(text['value'])
+                continue
+            if not isinstance(part, dict):
+                raise ProtocolError('A response content part had an invalid type.')
+            text = part.get('text')
+            if isinstance(text, str):
+                parts.append(text)
+            elif isinstance(text, dict):
+                value = text.get('value')
+                if not isinstance(value, str):
+                    raise ProtocolError(
+                        'A response content part text value had an invalid type.'
+                    )
+                parts.append(value)
+            elif text is not None:
+                raise ProtocolError('A response content part text had an invalid type.')
         return ''.join(parts)
-    return ''
+    if content is None:
+        return ''
+    raise ProtocolError('The chat response content had an invalid type.')
 
 
 def _token_count(value: Any) -> Optional[int]:
@@ -62,45 +73,81 @@ def _parse_usage(payload: Any) -> Optional[Usage]:
     return Usage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=total)
 
 
+def _tool_call_arguments(value: Any) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ProtocolError(
+                'A chat response tool call arguments value could not be serialized.'
+            ) from exc
+    raise ProtocolError('A chat response tool call arguments value had an invalid type.')
+
+
 def _parse_tool_calls(message: Mapping[str, Any]) -> tuple[ToolCall, ...]:
     calls: list[ToolCall] = []
     raw_calls = message.get('tool_calls')
-    if isinstance(raw_calls, list):
+    if raw_calls is not None:
+        if not isinstance(raw_calls, list):
+            raise ProtocolError('The chat response tool_calls field was not an array.')
         for raw_call in raw_calls:
             if not isinstance(raw_call, dict):
-                continue
+                raise ProtocolError('A chat response tool call was not a JSON object.')
             function = raw_call.get('function')
             if not isinstance(function, dict):
-                continue
+                raise ProtocolError(
+                    'A chat response tool call did not contain a function object.'
+                )
             name = function.get('name')
-            arguments = function.get('arguments')
-            if not isinstance(name, str):
-                name = ''
-            if isinstance(arguments, (dict, list)):
-                arguments = json.dumps(arguments, ensure_ascii=False)
-            if not isinstance(arguments, str):
-                arguments = ''
+            if name is not None and not isinstance(name, str):
+                raise ProtocolError('A chat response tool call name was not a string.')
             call_id = raw_call.get('id')
+            if call_id is not None and not isinstance(call_id, str):
+                raise ProtocolError('A chat response tool call id was not a string.')
             calls.append(
                 ToolCall(
-                    id=call_id if isinstance(call_id, str) else None,
-                    name=name,
-                    arguments=arguments,
+                    id=call_id,
+                    name=name or '',
+                    arguments=_tool_call_arguments(function.get('arguments')),
                 )
             )
     if not calls:
         legacy = message.get('function_call')
-        if isinstance(legacy, dict) and isinstance(legacy.get('name'), str):
-            arguments = legacy.get('arguments', '')
-            if isinstance(arguments, (dict, list)):
-                arguments = json.dumps(arguments, ensure_ascii=False)
-            calls.append(
-                ToolCall(
-                    id=None,
-                    name=legacy['name'],
-                    arguments=arguments if isinstance(arguments, str) else '',
+        if legacy is not None and not isinstance(legacy, dict):
+            raise ProtocolError('The chat response function_call field was not an object.')
+        if isinstance(legacy, dict):
+            name = legacy.get('name')
+            if name is not None and not isinstance(name, str):
+                raise ProtocolError('The legacy function_call name was not a string.')
+            if isinstance(name, str):
+                calls.append(
+                    ToolCall(
+                        id=None,
+                        name=name,
+                        arguments=_tool_call_arguments(legacy.get('arguments')),
+                    )
                 )
+    return tuple(calls)
+
+
+def _tool_calls_from_buffers(buffers: Mapping[int, dict[str, str]]) -> tuple[ToolCall, ...]:
+    '''Turn accumulated streaming fragments into complete tool calls.'''
+    calls = []
+    for index in sorted(buffers):
+        buffer = buffers[index]
+        if not buffer.get('id') and not buffer.get('name') and not buffer.get('arguments'):
+            continue
+        calls.append(
+            ToolCall(
+                id=buffer.get('id') or None,
+                name=buffer.get('name', ''),
+                arguments=buffer.get('arguments', ''),
             )
+        )
     return tuple(calls)
 
 
@@ -138,7 +185,7 @@ class OpenAICompatibleProvider(Provider):
         body = None
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-        return self.http.send(
+        response = self.http.send(
             HttpRequest(
                 method=method,
                 url=self._endpoint(path),
@@ -147,6 +194,9 @@ class OpenAICompatibleProvider(Provider):
                 timeout=self.config.timeout,
             )
         )
+        if isinstance(response, HttpResponse):
+            response.secrets = self.config.sensitive_values
+        return response
 
     def _raise_for_status(self, response: HttpResponse) -> None:
         if 200 <= response.status_code < 300:
@@ -155,14 +205,14 @@ class OpenAICompatibleProvider(Provider):
             response.status_code,
             response.url,
             response.text,
-            secret=self.config.api_key,
+            secrets=self.config.sensitive_values,
             retry_after=response.headers.get('retry-after'),
         )
 
     def _decode_json(self, response: HttpResponse) -> Any:
         try:
             return json.loads(response.text)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
             raise ProtocolError(
                 f'Expected JSON from {safe_url(response.url)} but received non-JSON content.'
             ) from exc
@@ -177,7 +227,7 @@ class OpenAICompatibleProvider(Provider):
             message = error
         if not message:
             message = 'unspecified error'
-        return redact_secret(truncate(str(message)), self.config.api_key)
+        return truncate(redact_sensitive(str(message), self.config.sensitive_values))
 
     def list_models(self) -> list[ModelInfo]:
         if self._models_cache is not None:
@@ -214,7 +264,12 @@ class OpenAICompatibleProvider(Provider):
             elif isinstance(entry, dict):
                 identifier = entry.get('id')
                 owned_by = entry.get('owned_by') if isinstance(entry.get('owned_by'), str) else None
-                created = entry.get('created') if isinstance(entry.get('created'), int) else None
+                raw_created = entry.get('created')
+                created = (
+                    raw_created
+                    if isinstance(raw_created, int) and not isinstance(raw_created, bool)
+                    else None
+                )
             else:
                 continue
             if not isinstance(identifier, str) or not identifier.strip():
@@ -239,13 +294,18 @@ class OpenAICompatibleProvider(Provider):
         tool_choice: Optional[str | Mapping[str, Any]] = None,
         response_format: Optional[Mapping[str, Any]] = None,
         stream: bool = False,
+        reasoning: bool = False,
+        include_usage: bool = False,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             'model': model,
             'messages': [dict(message) for message in messages],
-            'max_tokens': max_tokens,
-            'temperature': temperature,
         }
+        if reasoning:
+            payload['max_completion_tokens'] = max_tokens
+        else:
+            payload['max_tokens'] = max_tokens
+            payload['temperature'] = temperature
         if tools is not None:
             payload['tools'] = [dict(tool) for tool in tools]
         if tool_choice is not None:
@@ -254,6 +314,8 @@ class OpenAICompatibleProvider(Provider):
             payload['response_format'] = dict(response_format)
         if stream:
             payload['stream'] = True
+            if include_usage:
+                payload['stream_options'] = {'include_usage': True}
         return payload
 
     def chat(
@@ -266,6 +328,7 @@ class OpenAICompatibleProvider(Provider):
         tools: Optional[Sequence[ToolDefinition]] = None,
         tool_choice: Optional[str | Mapping[str, Any]] = None,
         response_format: Optional[Mapping[str, Any]] = None,
+        reasoning: bool = False,
     ) -> ChatResponse:
         payload = self._chat_payload(
             model=model,
@@ -275,6 +338,7 @@ class OpenAICompatibleProvider(Provider):
             tools=tools,
             tool_choice=tool_choice,
             response_format=response_format,
+            reasoning=reasoning,
         )
         started = time.perf_counter()
         with self._send('POST', '/chat/completions', payload=payload) as response:
@@ -298,7 +362,10 @@ class OpenAICompatibleProvider(Provider):
         message = choice.get('message')
         if not isinstance(message, dict):
             raise ProtocolError('The chat response choice did not contain a message object.')
-        content = _content_text(message.get('content'))
+        raw_content = message.get('content')
+        if raw_content is not None and not isinstance(raw_content, (str, list)):
+            raise ProtocolError('The chat response message content had an invalid type.')
+        content = _content_text(raw_content)
         tool_calls = _parse_tool_calls(message)
         finish_reason = choice.get('finish_reason')
         if not isinstance(finish_reason, str) or not finish_reason:
@@ -322,13 +389,19 @@ class OpenAICompatibleProvider(Provider):
         messages: Sequence[Message],
         max_tokens: int,
         temperature: float = 0.0,
+        tools: Optional[Sequence[ToolDefinition]] = None,
+        tool_choice: Optional[str | Mapping[str, Any]] = None,
+        include_usage: bool = False,
     ) -> Iterator[StreamEvent]:
         payload = self._chat_payload(
             model=model,
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            tools=tools,
+            tool_choice=tool_choice,
             stream=True,
+            include_usage=include_usage,
         )
         with self._send(
             'POST',
@@ -341,6 +414,66 @@ class OpenAICompatibleProvider(Provider):
 
     def _read_stream(self, response: HttpResponse) -> Iterator[StreamEvent]:
         saw_event = False
+        tool_buffers: dict[int, dict[str, str]] = {}
+        calls_emitted = False
+
+        def accumulate(delta: Mapping[str, Any]) -> None:
+            raw_calls = delta.get('tool_calls')
+            if raw_calls is not None:
+                if not isinstance(raw_calls, list):
+                    raise ProtocolError(
+                        'A streaming tool_calls delta was not an array.'
+                    )
+                for position, raw_call in enumerate(raw_calls):
+                    if not isinstance(raw_call, dict):
+                        raise ProtocolError(
+                            'A streaming tool call delta was not a JSON object.'
+                        )
+                    index = raw_call.get('index')
+                    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                        index = position
+                    buffer = tool_buffers.setdefault(
+                        index, {'id': '', 'name': '', 'arguments': ''}
+                    )
+                    call_id = raw_call.get('id')
+                    if call_id is not None and not isinstance(call_id, str):
+                        raise ProtocolError(
+                            'A streaming tool call id was not a string.'
+                        )
+                    if call_id and not buffer['id']:
+                        buffer['id'] = call_id
+                    function = raw_call.get('function')
+                    if function is not None and not isinstance(function, dict):
+                        raise ProtocolError(
+                            'A streaming tool call did not contain a function object.'
+                        )
+                    if isinstance(function, dict):
+                        name = function.get('name')
+                        if name is not None and not isinstance(name, str):
+                            raise ProtocolError(
+                                'A streaming tool call name was not a string.'
+                            )
+                        if name:
+                            buffer['name'] += name
+                        buffer['arguments'] += _tool_call_arguments(
+                            function.get('arguments')
+                        )
+            legacy = delta.get('function_call')
+            if legacy is not None and not isinstance(legacy, dict):
+                raise ProtocolError(
+                    'A streaming function_call delta was not a JSON object.'
+                )
+            if isinstance(legacy, dict):
+                buffer = tool_buffers.setdefault(0, {'id': '', 'name': '', 'arguments': ''})
+                name = legacy.get('name')
+                if name is not None and not isinstance(name, str):
+                    raise ProtocolError(
+                        'A streaming function_call name was not a string.'
+                    )
+                if name:
+                    buffer['name'] += name
+                buffer['arguments'] += _tool_call_arguments(legacy.get('arguments'))
+
         try:
             for line in response.iter_lines():
                 stripped = line.strip()
@@ -358,11 +491,15 @@ class OpenAICompatibleProvider(Provider):
                     continue
                 saw_event = True
                 if data == '[DONE]':
+                    if tool_buffers and not calls_emitted:
+                        calls = _tool_calls_from_buffers(tool_buffers)
+                        if calls:
+                            yield StreamEvent(tool_calls=calls)
                     yield StreamEvent(done=True)
                     return
                 try:
                     chunk = json.loads(data)
-                except (json.JSONDecodeError, ValueError) as exc:
+                except (json.JSONDecodeError, ValueError, RecursionError) as exc:
                     raise ProtocolError('A streaming chunk was not valid JSON.') from exc
                 if not isinstance(chunk, dict):
                     raise ProtocolError('A streaming chunk was not a JSON object.')
@@ -384,17 +521,38 @@ class OpenAICompatibleProvider(Provider):
                 if not isinstance(choice, dict):
                     raise ProtocolError('A streaming choice was not a JSON object.')
                 delta = choice.get('delta')
-                content = _content_text(delta.get('content')) if isinstance(delta, dict) else ''
+                if delta is not None and not isinstance(delta, dict):
+                    raise ProtocolError('A streaming delta was not a JSON object.')
+                if isinstance(delta, dict):
+                    accumulate(delta)
+                    raw_content = delta.get('content')
+                    if raw_content is not None and not isinstance(raw_content, (str, list)):
+                        raise ProtocolError(
+                            'A streaming delta content had an invalid type.'
+                        )
+                    content = _content_text(raw_content)
+                else:
+                    content = ''
                 finish_reason = choice.get('finish_reason')
                 if not isinstance(finish_reason, str) or not finish_reason:
                     finish_reason = None
-                if content or finish_reason or usage is not None:
+                calls: tuple[ToolCall, ...] = ()
+                if finish_reason in {'tool_calls', 'function_call'} and tool_buffers:
+                    calls = _tool_calls_from_buffers(tool_buffers)
+                    calls_emitted = bool(calls)
+                if content or finish_reason or usage is not None or calls:
                     yield StreamEvent(
                         content=content,
                         finish_reason=finish_reason,
                         usage=usage,
+                        tool_calls=calls,
                     )
             if not saw_event:
                 raise ProtocolError('The stream ended without any data events.')
+            if tool_buffers and not calls_emitted:
+                calls = _tool_calls_from_buffers(tool_buffers)
+                if calls:
+                    yield StreamEvent(tool_calls=calls)
         except (OSError, http.client.HTTPException) as exc:
-            raise NetworkError(f'The streaming response was interrupted: {exc}') from exc
+            detail = redact_sensitive(str(exc), self.config.sensitive_values)
+            raise NetworkError(f'The streaming response was interrupted: {detail}') from exc

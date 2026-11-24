@@ -8,11 +8,11 @@ from llm_compat.checks.base import (
     CheckContext,
     CompatibilityCheck,
     error_info,
+    failure_kind_for_exception,
     status_for_exception,
 )
 from llm_compat.errors import LLMCompatError
-from llm_compat.results import CheckResult, Status
-from llm_compat.utils import truncate
+from llm_compat.results import CheckResult, FailureKind, Status
 
 
 class StreamingCheck(CompatibilityCheck):
@@ -46,27 +46,35 @@ class StreamingCheck(CompatibilityCheck):
                 max_tokens=min(context.settings.max_tokens, 64),
                 temperature=0.0,
             )
-            for event in stream:
-                now_ms = (time.perf_counter() - started) * 1000.0
-                if event.content:
-                    chunks += 1
-                    if first_content_ms is None:
-                        first_content_ms = now_ms
-                    parts.append(event.content)
-                if event.finish_reason:
-                    finish_reason = event.finish_reason
-                if event.usage is not None:
-                    usage = event.usage
-                if event.done:
-                    done = True
-                    break
+            try:
+                for event in stream:
+                    now_ms = (time.perf_counter() - started) * 1000.0
+                    if event.content:
+                        chunks += 1
+                        if first_content_ms is None:
+                            first_content_ms = now_ms
+                        parts.append(event.content)
+                    if event.finish_reason:
+                        finish_reason = event.finish_reason
+                    if event.usage is not None:
+                        usage = event.usage
+                    if event.done:
+                        done = True
+                        break
+            finally:
+                close = getattr(stream, 'close', None)
+                if callable(close):
+                    close()
         except LLMCompatError as exc:
             elapsed = (time.perf_counter() - started) * 1000.0
             if not parts:
                 raise
             return self.result(
                 status_for_exception(exc),
-                f'Stream failed after {chunks} content chunk(s): {exc}',
+                context.redact(
+                    f'Stream failed after {chunks} content chunk(s): {exc}',
+                    500,
+                ),
                 details={
                     'content_chunks': chunks,
                     'first_content_ms': (
@@ -75,9 +83,14 @@ class StreamingCheck(CompatibilityCheck):
                     'duration_ms': round(elapsed, 2),
                     'finish_reason': finish_reason,
                     'done': done,
-                    'content_preview': truncate(''.join(parts), 200),
+                    'content_preview': context.redact(''.join(parts), 200),
                 },
-                error=error_info(exc),
+                error=error_info(
+                    exc,
+                    failure_kind=failure_kind_for_exception(exc),
+                    secrets=context.provider.config.sensitive_values,
+                ),
+                failure_kind=failure_kind_for_exception(exc),
             )
         elapsed = (time.perf_counter() - started) * 1000.0
         content = ''.join(parts)
@@ -89,7 +102,7 @@ class StreamingCheck(CompatibilityCheck):
             'duration_ms': round(elapsed, 2),
             'finish_reason': finish_reason,
             'done': done,
-            'content_preview': truncate(content, 200),
+            'content_preview': context.redact(content, 200),
             'usage': usage.to_dict() if usage is not None else None,
         }
         if not content:
@@ -97,6 +110,7 @@ class StreamingCheck(CompatibilityCheck):
                 Status.FAIL,
                 'The stream ended without any text content.',
                 details=details,
+                failure_kind=FailureKind.MODEL_BEHAVIOR,
             )
         ttft = f'{first_content_ms:.0f} ms' if first_content_ms is not None else 'unknown'
         if not done:
@@ -105,6 +119,7 @@ class StreamingCheck(CompatibilityCheck):
                 f'Received {chunks} chunk(s) with first content in {ttft}, '
                 'but the stream ended without a [DONE] marker.',
                 details=details,
+                failure_kind=FailureKind.MALFORMED,
             )
         if finish_reason is None:
             return self.result(
@@ -112,6 +127,7 @@ class StreamingCheck(CompatibilityCheck):
                 f'Received {chunks} chunk(s) with first content in {ttft}, '
                 'but no chunk reported a finish reason.',
                 details=details,
+                failure_kind=FailureKind.MALFORMED,
             )
         if chunks < 2:
             return self.result(
@@ -119,6 +135,7 @@ class StreamingCheck(CompatibilityCheck):
                 f'Received only one content chunk with first content in {ttft}; '
                 'incremental streaming could not be confirmed.',
                 details=details,
+                failure_kind=FailureKind.UNSUPPORTED,
             )
         return self.result(
             Status.PASS,

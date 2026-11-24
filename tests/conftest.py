@@ -23,6 +23,12 @@ def mock_server() -> Any:
 
 
 @pytest.fixture
+def mock_server_two() -> Any:
+    with MockAPIServer() as server:
+        yield server
+
+
+@pytest.fixture
 def config_factory(
     mock_server: MockAPIServer,
 ) -> Callable[..., ProviderConfig]:

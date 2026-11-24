@@ -49,21 +49,28 @@ OpenAI-compatible API. Tests must:
 
 Do not add live-provider tests to the default suite. If you need an optional manual live
 check, require explicit authorization, keep it out of CI, and never commit the output.
+Follow the optional live-testing procedure in
+[README.md](README.md#optional-live-testing).
 
 ## Adding a check
 
 1. Create a module under `llm_compat/checks/` with a class that subclasses
    `CompatibilityCheck`.
 2. Set a stable lowercase `id`, a human-readable `name`, a `category`, a one-line
-   `description`, and `requires_model` when the check needs a selected chat model.
+   `description`, and `requires_model` when the check needs a selected chat model. Set
+   `default_enabled = False` for opt-in checks that may reject valid provider parameters.
 3. Implement `run(context)`. Use `context.provider` for all HTTP work and
    `context.settings` for bounded user settings.
-4. Return `self.result(Status.PASS|FAIL|WARN|SKIP, message, details=..., error=...)`.
+4. Return `self.result(Status.PASS|FAIL|WARN|ERROR|SKIP, message, details=..., error=...)`.
    Raise typed errors from `llm_compat/errors.py` for failures; the base class records
    timing and maps exceptions to FAIL or ERROR.
-5. Use `truncate` for previews and never include secrets or credentials in messages.
-6. Register the check in `llm_compat/checks/registry.py`.
-7. Add tests against the mock server and update the check table in `README.md`.
+5. Attach the most specific `FailureKind` (`unsupported`, `malformed`, `model_behavior`,
+   `authentication`, `temporary`, `configuration`, or `unknown`) so users can distinguish
+   a missing feature from a broken response or a transient provider problem.
+6. Use `context.redact` for response previews and never include secrets or credentials
+   in messages. It redacts known credentials before truncating.
+7. Register the check in `llm_compat/checks/registry.py`.
+8. Add tests against the mock server and update the check table in `README.md`.
 
 Check IDs are public API. Once released, do not rename or repurpose an ID; add a new
 check instead. Keep a check focused on one compatibility property so failures identify

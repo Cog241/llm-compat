@@ -7,7 +7,7 @@ handling of credentials, URLs, and generated reports seriously.
 
 | Version | Supported |
 | --- | --- |
-| `0.1.x` | Yes |
+| `0.2.x` | Yes |
 
 While the project is pre-1.0, security fixes are made on the latest release only.
 
@@ -41,15 +41,21 @@ disclosure and release. Please allow time for a fix before publishing details.
   and their Authorization headers go only to the configured endpoint (same-origin
   redirects, such as a missing trailing slash, are followed).
 - **No key serialization.** Reports contain an `auth_configured` boolean, not the key or
-  authorization header. Error messages do not include request headers.
+  authorization header. Error messages redact known secrets and common credential
+  patterns before they are surfaced, and reports redact provider names, models, messages,
+  hints, previews, details, and comparison output centrally.
+- **HTTPS for remote authentication.** TLS verification is always on. A remote
+  authenticated `http://` endpoint is rejected before a request is sent. Loopback HTTP is
+  allowed for local servers, and `allow_insecure_http=True` / `--allow-insecure-http` is an
+  explicit override for authorized development environments.
 - **URL sanitization.** `safe_url` removes user information, query strings, and fragments
   before URLs are written to terminal output or JSON reports.
 - **No telemetry.** LLM Compat has no analytics or background network activity. Traffic
   goes only to the endpoint the user configures.
 - **TLS verification.** The default transport uses standard-library TLS verification and
   does not provide an option to disable certificate checks.
-- **Bounded input.** Base URLs, headers, timeouts, sample counts, and token limits are
-  validated before requests are sent. Base URLs with internal whitespace, control
+- **Input validation.** Base URLs, headers, timeouts, sample counts, and token limits
+  are validated before requests are sent. Base URLs with internal whitespace, control
   characters, credentials, query strings, fragments, or invalid ports are rejected.
   API-key and header values containing control characters are rejected, and header names
   must be valid HTTP tokens.

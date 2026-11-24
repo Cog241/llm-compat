@@ -67,12 +67,18 @@ class ChatResponse:
 
 @dataclass(frozen=True)
 class StreamEvent:
-    '''One meaningful Server-Sent Events chunk.'''
+    '''One meaningful Server-Sent Events chunk.
+
+    ``tool_calls`` is populated on the event that finalizes a streamed tool
+    call. The adapter assembles argument fragments before yielding it, so
+    checks see complete calls rather than transport-specific deltas.
+    '''
 
     content: str = ''
     finish_reason: Optional[str] = None
     usage: Optional[Usage] = None
     done: bool = False
+    tool_calls: tuple[ToolCall, ...] = ()
 
 
 class Provider(ABC):
@@ -108,8 +114,14 @@ class Provider(ABC):
         tools: Optional[Sequence[ToolDefinition]] = None,
         tool_choice: Optional[str | Mapping[str, Any]] = None,
         response_format: Optional[Mapping[str, Any]] = None,
+        reasoning: bool = False,
     ) -> ChatResponse:
-        '''Send one non-streaming chat completion request.'''
+        '''Send one non-streaming chat completion request.
+
+        ``reasoning`` selects the request shape used by reasoning models:
+        ``max_completion_tokens`` instead of ``max_tokens`` and no sampling
+        temperature. It is opt-in because not every endpoint accepts it.
+        '''
 
     @abstractmethod
     def stream_chat(
@@ -119,6 +131,9 @@ class Provider(ABC):
         messages: Sequence[Message],
         max_tokens: int,
         temperature: float = 0.0,
+        tools: Optional[Sequence[ToolDefinition]] = None,
+        tool_choice: Optional[str | Mapping[str, Any]] = None,
+        include_usage: bool = False,
     ) -> Iterator[StreamEvent]:
         '''Send one streaming chat completion request.'''
 
