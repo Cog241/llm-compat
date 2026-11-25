@@ -368,5 +368,5 @@ def test_runner_extra_import_guard() -> None:
     # Keep a direct import of public API symbols exercised by the test suite.
     import llm_compat
 
-    assert llm_compat.__version__ == '0.2.0'
+    assert llm_compat.__version__ == '0.3.0'
     assert callable(llm_compat.run_compatibility)

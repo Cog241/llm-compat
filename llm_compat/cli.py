@@ -4,20 +4,32 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from llm_compat.agents import (
+    AgentExecution,
+    evaluate_agent,
+    get_profile,
+    list_profiles,
+    render_agent_text,
+)
 from llm_compat.checks.base import CompatibilityCheck
 from llm_compat.checks.registry import available_checks, select_checks
 from llm_compat.compare import compare_providers, render_comparison_text
 from llm_compat.config import ProviderConfig, RunSettings
 from llm_compat.errors import ConfigurationError, LLMCompatError
 from llm_compat.providers.registry import build_provider, get_preset, list_presets
-from llm_compat.report import render_json, render_text
+from llm_compat.report import CompatibilityReport, render_json, render_text
+from llm_compat.research import load_experiment, run_experiment
+from llm_compat.results import summarize
 from llm_compat.runner import RunOptions, run_compatibility
-from llm_compat.utils import redact_sensitive, redact_value, safe_url, truncate
+from llm_compat.utils import redact_sensitive, redact_value, safe_url, truncate, utc_now
 from llm_compat.version import __version__
 
 
@@ -243,8 +255,102 @@ def _build_parser() -> argparse.ArgumentParser:
         description='List connection presets and their API key environment variables.',
     )
     _add_output_options(providers_parser)
-    return parser
 
+    agent_parser = subparsers.add_parser(
+        'agent',
+        help='Inspect and test coding-agent compatibility profiles.',
+        description=(
+            'Evaluate documented agent protocol requirements. Protocol results are '
+            'inferred from checks; an actual agent is never launched unless an explicit '
+            '--verify-command is supplied.'
+        ),
+    )
+    agent_subparsers = agent_parser.add_subparsers(dest='agent_command', required=True)
+    agent_list_parser = agent_subparsers.add_parser(
+        'list',
+        help='List built-in agent profiles and their required capabilities.',
+    )
+    _add_output_options(agent_list_parser)
+    agent_test_parser = agent_subparsers.add_parser(
+        'test',
+        help='Run protocol checks and map them to one agent profile.',
+    )
+    agent_test_parser.add_argument(
+        '--agent',
+        required=True,
+        choices=[
+            *[profile.key for profile in list_profiles()],
+            'roo',
+            'roocode',
+            'open-code',
+        ],
+        help='Agent profile to evaluate (aliases: roo, roocode, open-code).',
+    )
+    _add_connection_options(agent_test_parser)
+    agent_test_parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Print the profile plan without making network requests.',
+    )
+    agent_test_parser.add_argument(
+        '--yes',
+        action='store_true',
+        help='Authorize live protocol requests and any verify command without prompting.',
+    )
+    agent_test_parser.add_argument(
+        '--verify-command',
+        metavar='COMMAND',
+        help=(
+            'Optional shell command that actually runs the agent after protocol tests. '
+            'Requires --yes. The command and output are sanitized before reporting.'
+        ),
+    )
+    agent_test_parser.add_argument(
+        '--verify-timeout',
+        type=float,
+        default=300.0,
+        metavar='SECONDS',
+        help='Maximum time for --verify-command (default: 300).',
+    )
+    _add_output_options(agent_test_parser, color=True)
+
+    research_parser = subparsers.add_parser(
+        'research',
+        help='Validate or run reproducible provider/model experiments.',
+        description='Run repeated, budgeted trials and export sanitized research datasets.',
+    )
+    research_subparsers = research_parser.add_subparsers(
+        dest='research_command', required=True
+    )
+    research_validate_parser = research_subparsers.add_parser(
+        'validate',
+        help='Validate an experiment config and print its plan without network requests.',
+    )
+    research_validate_parser.add_argument('config', metavar='CONFIG', help='Experiment JSON file.')
+    _add_output_options(research_validate_parser)
+    research_run_parser = research_subparsers.add_parser(
+        'run',
+        help='Run an authorized experiment and write sanitized outputs.',
+    )
+    research_run_parser.add_argument('config', metavar='CONFIG', help='Experiment JSON file.')
+    research_run_parser.add_argument(
+        '--output-dir',
+        metavar='PATH',
+        help='Override output_dir from the experiment config.',
+    )
+    research_run_parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Print the experiment plan without making network requests.',
+    )
+    research_run_parser.add_argument(
+        '--yes',
+        action='store_true',
+        help='Authorize live requests without an interactive confirmation.',
+    )
+    _add_output_options(research_run_parser)
+
+    return parser
 
 def _build_config(args: argparse.Namespace) -> ProviderConfig:
     preset = get_preset(args.provider)
@@ -335,16 +441,19 @@ def _authorize_targets(
         )
         return False
     total = sum(count for _, count in targets)
+    secrets = tuple(
+        secret for config, _ in targets for secret in config.sensitive_values
+    )
     print('', file=sys.stderr)
     print(
         'LLM Compat will send live API requests that may incur provider charges.',
         file=sys.stderr,
     )
-    print(f'Purpose: {purpose}', file=sys.stderr)
-    print(f'Estimated requests: about {total}', file=sys.stderr)
-    secrets = tuple(
-        secret for config, _ in targets for secret in config.sensitive_values
+    print(
+        f'Purpose: {truncate(redact_sensitive(purpose, secrets), 500)}',
+        file=sys.stderr,
     )
+    print(f'Estimated requests: about {total}', file=sys.stderr)
     for config, count in targets:
         print(
             f'Target: {truncate(redact_sensitive(config.name, secrets), 80)}  '
@@ -893,6 +1002,460 @@ def _cmd_providers(args: argparse.Namespace) -> int:
     return 0
 
 
+def _empty_protocol_report(config: ProviderConfig) -> CompatibilityReport:
+    now = utc_now()
+    return CompatibilityReport(
+        provider_name=config.name,
+        base_url=config.base_url,
+        model=config.model,
+        model_source='explicit' if config.model else 'auto',
+        auth_configured=config.auth_configured,
+        started_at=now,
+        finished_at=now,
+        duration_ms=0.0,
+        results=(),
+        summary=summarize(()),
+        secrets=config.sensitive_values,
+    )
+
+
+def _cmd_agent_list(args: argparse.Namespace) -> int:
+    profiles = list_profiles()
+    if args.format == 'json':
+        payload = {
+            'schema_version': '1.0',
+            'tool': {'name': 'llm-compat', 'version': __version__},
+            'agents': [profile.to_dict() for profile in profiles],
+        }
+        text = json.dumps(payload, indent=2, ensure_ascii=False)
+    else:
+        lines = [f'Built-in agent profiles ({len(profiles)})']
+        for profile in profiles:
+            required = [
+                capability.name
+                for capability in profile.capabilities
+                if capability.required
+            ]
+            optional = [
+                capability.name
+                for capability in profile.capabilities
+                if not capability.required
+            ]
+            lines.append(f'  {profile.key:<10} {profile.name}')
+            lines.append(f'             protocol: {profile.protocol}')
+            lines.append(f'             required: {", ".join(required) or "none"}')
+            if optional:
+                lines.append(f'             optional: {", ".join(optional)}')
+            lines.append(f'             docs: {profile.docs_url}')
+        lines.extend(
+            [
+                '',
+                'Test a profile:',
+                '  llm-compat agent test --agent opencode --provider custom \\',
+                '    --base-url URL --model MODEL --api-key-env ENV_VAR --yes',
+            ]
+        )
+        text = '\n'.join(lines)
+    _emit(text, args)
+    return 0
+
+
+def _agent_checks(profile: Any) -> list[CompatibilityCheck]:
+    if not profile.check_ids:
+        return []
+    return select_checks(only=profile.check_ids)
+
+
+def _agent_dry_run_payload(
+    profile: Any,
+    config: ProviderConfig,
+    checks: Sequence[CompatibilityCheck],
+    request_count: int,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    payload = {
+        'schema_version': '1.0',
+        'tool': {'name': 'llm-compat', 'version': __version__},
+        'dry_run': True,
+        'agent': profile.to_dict(),
+        'provider': {
+            'name': config.name,
+            'base_url': safe_url(config.base_url),
+            'model': config.model,
+            'model_source': 'explicit' if config.model else 'auto',
+            'auth_configured': config.auth_configured,
+        },
+        'estimated_requests': request_count,
+        'authorization_required': bool(checks) or bool(args.verify_command),
+        'verify_command_configured': bool(args.verify_command),
+        'checks': [check.id for check in checks],
+    }
+    return redact_value(payload, config.sensitive_values)
+
+
+def _render_agent_dry_run(
+    profile: Any,
+    config: ProviderConfig,
+    checks: Sequence[CompatibilityCheck],
+    request_count: int,
+    verify_command: Optional[str],
+) -> str:
+    secrets = config.sensitive_values
+    lines = [
+        f'LLM Compat {__version__} - {profile.name} profile dry run',
+        'Dry run: no network requests were made and no agent was launched.',
+        f'Protocol: {profile.protocol}',
+        f'Provider: {truncate(redact_sensitive(config.name, secrets), 120)}  '
+        f'{truncate(redact_sensitive(safe_url(config.base_url), secrets), 300)}',
+        f'Model: {truncate(redact_sensitive(config.model, secrets), 200) if config.model else "(auto)"}',
+        '',
+        'Capabilities',
+    ]
+    for capability in profile.capabilities:
+        requirement = 'required' if capability.required else 'optional'
+        check = capability.check_id or 'not implemented'
+        lines.append(f'  {capability.name:<30} {requirement:<9} check={check}')
+    lines.extend(
+        [
+            '',
+            f'Checks selected: {", ".join(check.id for check in checks) or "none"}',
+            f'Estimated live requests: {request_count}',
+            (
+                'Verification: inferred from protocol checks unless --verify-command is run.'
+                if checks
+                else 'Verification: no protocol checks are implemented for this profile; '
+                'a live test without --verify-command is inconclusive. An authorized '
+                '--verify-command adds execution evidence but does not verify the protocol.'
+            ),
+        ]
+    )
+    if verify_command:
+        lines.append(
+            'Verify command: configured; it will run only with --yes after protocol checks.'
+        )
+    return '\n'.join(lines)
+
+
+def _run_verify_command(
+    command: str,
+    config: ProviderConfig,
+    timeout: float,
+) -> AgentExecution:
+    started = time.perf_counter()
+    timed_out = False
+    exit_code: Optional[int]
+    output = ''
+    try:
+        completed = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            errors='replace',
+            timeout=timeout,
+            check=False,
+        )
+        exit_code = completed.returncode
+        output = (completed.stdout or '') + (completed.stderr or '')
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        exit_code = None
+        stdout = (
+            exc.stdout.decode(errors='replace')
+            if isinstance(exc.stdout, bytes)
+            else exc.stdout
+        )
+        stderr = (
+            exc.stderr.decode(errors='replace')
+            if isinstance(exc.stderr, bytes)
+            else exc.stderr
+        )
+        output = (stdout or '') + (stderr or '')
+    except (OSError, ValueError) as exc:
+        exit_code = None
+        output = str(exc)
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    secrets = config.sensitive_values
+    return AgentExecution(
+        command=truncate(redact_sensitive(command, secrets), 500),
+        exit_code=exit_code,
+        timed_out=timed_out,
+        duration_ms=duration_ms,
+        output_preview=truncate(redact_sensitive(output, secrets), 2000),
+    )
+
+
+def _cmd_agent_test(args: argparse.Namespace) -> int:
+    profile = get_profile(args.agent)
+    if profile is None:
+        raise ConfigurationError(f'Unknown agent profile: {args.agent!r}.')
+    if args.verify_command is not None and not args.verify_command.strip():
+        raise ConfigurationError('--verify-command must be a non-empty command.')
+    if not math.isfinite(args.verify_timeout) or args.verify_timeout <= 0:
+        raise ConfigurationError('--verify-timeout must be a finite number greater than zero.')
+    checks = _agent_checks(profile)
+    config = _build_config(args)
+    request_count = (
+        _estimated_requests(checks, 1, model_explicit=config.model is not None)
+        if checks
+        else 0
+    )
+    if args.dry_run:
+        if args.format == 'json':
+            text = json.dumps(
+                _agent_dry_run_payload(profile, config, checks, request_count, args),
+                indent=2,
+                ensure_ascii=False,
+            )
+        else:
+            text = _render_agent_dry_run(
+                profile, config, checks, request_count, args.verify_command
+            )
+        _emit(text, args)
+        return 0
+    if args.verify_command and not args.yes:
+        print(
+            'error: --verify-command runs the actual agent and requires explicit --yes '
+            'authorization.',
+            file=sys.stderr,
+        )
+        return 2
+    if checks:
+        if not _authorize(
+            args,
+            config,
+            purpose=f'{profile.name} protocol checks',
+            request_count=request_count,
+        ):
+            return 2
+        protocol_report = run_compatibility(
+            config,
+            RunOptions(authorize=True, samples=1, max_tokens=128),
+            provider=build_provider(config),
+            checks=checks,
+        )
+    else:
+        protocol_report = _empty_protocol_report(config)
+    execution = None
+    if args.verify_command:
+        execution = _run_verify_command(
+            args.verify_command,
+            config,
+            args.verify_timeout,
+        )
+    agent_report = evaluate_agent(profile, protocol_report, execution=execution)
+    if args.format == 'json':
+        text = json.dumps(agent_report.to_dict(), indent=2, ensure_ascii=False)
+    else:
+        text = render_agent_text(agent_report, color=_use_color(args))
+    _emit(text, args)
+    return 0 if agent_report.verdict == 'compatible' else 1
+
+
+def _research_plan(
+    config: Any,
+    resolved: Sequence[Any],
+) -> tuple[list[CompatibilityCheck], int]:
+    checks = select_checks(only=config.checks)
+    per_target = [
+        _estimated_requests(
+            checks,
+            config.samples,
+            model_explicit=target.requested_model is not None,
+        )
+        for target in resolved
+    ]
+    return checks, sum(per_target) * config.trials
+
+
+def _research_plan_payload(
+    config: Any,
+    resolved: Sequence[Any],
+    checks: Sequence[CompatibilityCheck],
+    output_dir: str,
+    estimated_requests: int,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    payload = {
+        'schema_version': '1.0',
+        'tool': {'name': 'llm-compat', 'version': __version__},
+        'dry_run': dry_run,
+        'experiment': config.name,
+        'description': config.description,
+        'config_fingerprint': config.with_output_dir(output_dir).fingerprint(resolved),
+        'targets': [target.to_safe_dict() for target in resolved],
+        'checks': [check.id for check in checks],
+        'trials': config.trials,
+        'samples': config.samples,
+        'max_tokens': config.max_tokens,
+        'seed': config.seed,
+        'randomize_order': config.randomize_order,
+        'request_budget': config.request_budget,
+        'rate_limit_per_second': config.rate_limit_per_second,
+        'estimated_requests': estimated_requests,
+        'authorization_required': True,
+        'output_dir': output_dir,
+    }
+    secrets = tuple(
+        secret for target in resolved for secret in target.config.sensitive_values
+    )
+    return redact_value(payload, secrets)
+
+
+def _render_research_plan(
+    config: Any,
+    resolved: Sequence[Any],
+    checks: Sequence[CompatibilityCheck],
+    output_dir: str,
+    estimated_requests: int,
+) -> str:
+    secrets = tuple(
+        secret for target in resolved for secret in target.config.sensitive_values
+    )
+    lines = [
+        f'LLM Compat {__version__} - research plan',
+        'No network requests were made.',
+        f'Experiment: {truncate(redact_sensitive(config.name, secrets), 200)}',
+    ]
+    if config.description:
+        lines.append(f'Description: {truncate(redact_sensitive(config.description, secrets), 300)}')
+    lines.extend(['', f'Targets ({len(resolved)})'])
+    for target in resolved:
+        lines.append(
+            f'  {truncate(redact_sensitive(target.target.name, secrets), 80)}  '
+            f'{truncate(redact_sensitive(safe_url(target.config.base_url), secrets), 300)}  '
+            f'model={truncate(redact_sensitive(target.requested_model or "(auto)", secrets), 100)}  '
+            f'credentials={"configured" if target.config.auth_configured else "not configured"}'
+        )
+    lines.extend(
+        [
+            '',
+            f'Checks: {", ".join(check.id for check in checks)}',
+            f'Trials per target: {config.trials}  samples: {config.samples}  max_tokens: {config.max_tokens}',
+            f'Order: {"randomized" if config.randomize_order else "fixed"} (seed={config.seed})',
+            f'Request budget: {config.request_budget}  rate limit: '
+            + (f'{config.rate_limit_per_second:g}/s' if config.rate_limit_per_second else 'none'),
+            f'Estimated live requests: about {estimated_requests}',
+            f'Output directory: {truncate(redact_sensitive(output_dir, secrets), 500)}',
+            'Authorization: required before any live request; use --yes or type yes interactively.',
+        ]
+    )
+    return '\n'.join(lines)
+
+
+def _cmd_research_validate(args: argparse.Namespace) -> int:
+    config = load_experiment(args.config)
+    resolved = config.resolve_targets(require_credentials=False)
+    checks, estimated = _research_plan(config, resolved)
+    output_dir = str(Path(config.output_dir).expanduser())
+    if args.format == 'json':
+        text = json.dumps(
+            _research_plan_payload(
+                config, resolved, checks, output_dir, estimated, dry_run=True
+            ),
+            indent=2,
+            ensure_ascii=False,
+        )
+    else:
+        text = _render_research_plan(config, resolved, checks, output_dir, estimated)
+    _emit(text, args)
+    return 0
+
+
+def _render_research_result(report: Any) -> str:
+    overall = report.summary.get('overall', {})
+    files = [
+        'raw_results.json',
+        'results.csv',
+        'requests.csv',
+        'summary.json',
+        'methodology.md',
+        'environment.json',
+        'experiment.json',
+    ]
+    secrets = report.secrets
+    lines = [
+        'Research experiment complete: '
+        + truncate(redact_sensitive(report.config.name, secrets), 300),
+        f'Output directory: {truncate(redact_sensitive(report.output_dir, secrets), 500)}',
+        f'Trials: {overall.get("trials", 0)} / {overall.get("planned_trials", 0)}',
+        f'Requests: {overall.get("requests_used", 0)} / {overall.get("request_budget", 0)} budget',
+        f'Verdicts: {json.dumps(overall.get("verdicts", {}), sort_keys=True)}',
+        f'Budget exhausted: {"yes" if overall.get("budget_exhausted") else "no"}',
+        '',
+        'Files',
+    ]
+    lines.extend(f'  {name}' for name in files)
+    return '\n'.join(lines)
+
+
+def _cmd_research_run(args: argparse.Namespace) -> int:
+    config = load_experiment(args.config)
+    resolved = config.resolve_targets(require_credentials=not args.dry_run)
+    checks, estimated = _research_plan(config, resolved)
+    output_dir = str(Path(args.output_dir or config.output_dir).expanduser())
+    if args.dry_run:
+        if args.format == 'json':
+            text = json.dumps(
+                _research_plan_payload(
+                    config, resolved, checks, output_dir, estimated, dry_run=True
+                ),
+                indent=2,
+                ensure_ascii=False,
+            )
+        else:
+            text = _render_research_plan(config, resolved, checks, output_dir, estimated)
+        _emit(text, args)
+        return 0
+    targets = [
+        (
+            target.config,
+            _estimated_requests(
+                checks,
+                config.samples,
+                model_explicit=target.requested_model is not None,
+            )
+            * config.trials,
+        )
+        for target in resolved
+    ]
+    if not _authorize_targets(
+        args,
+        targets,
+        purpose=f'research experiment {config.name!r} ({config.trials} trial(s) per target)',
+    ):
+        return 2
+    report = run_experiment(config, authorize=True, output_dir=output_dir)
+    if args.format == 'json':
+        payload = redact_value(
+            {
+                'schema_version': '1.0',
+                'tool': {'name': 'llm-compat', 'version': __version__},
+                'output_dir': report.output_dir,
+                'files': [
+                    'raw_results.json',
+                    'results.csv',
+                    'requests.csv',
+                    'summary.json',
+                    'methodology.md',
+                    'environment.json',
+                    'experiment.json',
+                ],
+                'summary': report.summary,
+            },
+            report.secrets,
+        )
+        text = json.dumps(payload, indent=2, ensure_ascii=False)
+    else:
+        text = _render_research_result(report)
+    _emit(text, args)
+    overall = report.summary.get('overall', {})
+    if overall.get('budget_exhausted') or any(trial.status == 'error' for trial in report.trials):
+        return 1
+    return 0
+
+
 def _print_error(exc: LLMCompatError) -> None:
     print(f'error: {truncate(redact_sensitive(str(exc)), 1000)}', file=sys.stderr)
     if exc.hint:
@@ -917,6 +1480,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_checks(args)
         if args.command == 'providers':
             return _cmd_providers(args)
+        if args.command == 'agent':
+            if args.agent_command == 'list':
+                return _cmd_agent_list(args)
+            if args.agent_command == 'test':
+                return _cmd_agent_test(args)
+            parser.error(f'Unknown agent command: {args.agent_command}')
+        if args.command == 'research':
+            if args.research_command == 'validate':
+                return _cmd_research_validate(args)
+            if args.research_command == 'run':
+                return _cmd_research_run(args)
+            parser.error(f'Unknown research command: {args.research_command}')
         parser.error(f'Unknown command: {args.command}')
         return 2
     except ConfigurationError as exc:

@@ -5,3 +5,5 @@ include SECURITY.md
 include CHANGELOG.md
 include pyproject.toml
 recursive-include tests *.py
+recursive-include examples *.json *.md *.sh
+recursive-include docs *.md

@@ -15,9 +15,11 @@ It is provider-agnostic and works with hosted APIs, gateways, and local servers.
 to answer: can I connect and authenticate, which advertised features actually work, and
 what latency and throughput should I expect?
 
-Version 0.2 adds opt-in tool/schema/reasoning checks, multi-provider comparison, richer
-performance metrics, stricter credential redaction, and HTTPS enforcement for remote
-authenticated endpoints. See [CHANGELOG.md](CHANGELOG.md).
+Version 0.3 adds coding-agent compatibility profiles, explicitly authorized agent
+execution evidence, and reproducible research experiments with resumable, sanitized
+datasets. The v0.2 features remain: opt-in tool/schema/reasoning checks, multi-provider
+comparison, richer performance metrics, stricter credential redaction, and HTTPS
+enforcement for remote authenticated endpoints. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Requirements
 
@@ -26,6 +28,15 @@ authenticated endpoints. See [CHANGELOG.md](CHANGELOG.md).
 - No third-party Python packages at runtime. The default transport uses the standard library.
 
 ## Installation
+
+Once release artifacts are published on PyPI:
+
+```bash
+python -m pip install llm-compat
+llm-compat --version
+```
+
+The 0.3 source tree is also installable directly from a checkout:
 
 ```bash
 git clone https://github.com/Cog241/llm-compat.git
@@ -158,9 +169,10 @@ Reports expose `failure_kind` per result, `error.failure_kind` when an error obj
 exists, and aggregate `summary.failure_kinds` counts.
 
 The summary verdict is `compatible` when every selected check passes with no warnings
-or skips; `incompatible` when checks failed or errored and none passed; `partial` for a
-mixture, warnings, or skips; and `inconclusive` when no check executed. The score is the
-percentage of executed checks that passed; skipped checks are excluded.
+or skips; `inconclusive` when no check executed; `incompatible` when at least one check
+failed or errored and none passed; and `partial` otherwise, including warnings, skips, or
+a mix of passes and failures. The score is the percentage of executed checks that passed;
+skipped checks are excluded.
 
 ## Performance measurements
 
@@ -234,14 +246,108 @@ Comparison output has a `providers` array, each with the same provider, timing,
 summary, and results sections as a single-provider report. Failures are printed with
 their failure class. The library equivalent is `compare_providers(configs, options)`.
 
+## Coding-agent compatibility profiles
+
+Agent profiles map documented agent requirements onto the same protocol checks. They
+answer a narrower question than an agent run: does the endpoint expose the request,
+streaming, and tool shapes this agent expects? Reports use `inferred_protocol` when
+checks ran, `not_run` when a profile has no implemented checks, and `agent_execution`
+only when you authorize a command that actually runs the agent.
+
+| Profile | Wire protocol | Required capabilities |
+| --- | --- | --- |
+| `aider` | Chat Completions | Chat completions and system messages. Streaming is optional because Aider can use `--no-stream`. |
+| `cline` | Chat Completions | Chat, streaming, system messages, multi-turn tools, and streamed tool calls. |
+| `codex` | Responses | Responses API, Responses streaming, and Responses function tools. No Chat Completions checks are inferred. |
+| `opencode` | Chat Completions | Chat, streaming, system messages, multi-turn tools, and streamed tool calls. |
+| `roo-code` | Chat Completions | Chat, streaming, system messages, multi-turn tools, and streamed tool calls. |
+
+Optional capabilities such as strict schema output, parallel tools, and reasoning request
+shapes are also reported. Use `agent list` to see the documentation basis and every
+capability:
+
+```bash
+llm-compat agent list
+llm-compat agent list --format json
+```
+
+Inspect a profile plan without sending requests:
+
+```bash
+llm-compat agent test --agent opencode \
+  --provider custom --base-url https://llm.example.com/v1 \
+  --model example-chat --dry-run
+```
+
+Run the inferred protocol tests after reviewing the plan:
+
+```bash
+llm-compat agent test --agent opencode \
+  --provider custom --base-url https://llm.example.com/v1 \
+  --model example-chat --api-key-env MY_PROVIDER_KEY --yes \
+  --format json --output agent-report.json
+```
+
+To collect execution-level evidence, pass an explicitly authorized command that launches
+the real agent. The command runs only with `--yes`; its command string and output preview
+are sanitized before they appear in the report. Otherwise the report never claims the
+agent itself was run:
+
+```bash
+llm-compat agent test --agent opencode \
+  --provider custom --base-url https://llm.example.com/v1 \
+  --model example-chat --api-key-env MY_PROVIDER_KEY --yes \
+  --verify-command 'opencode run "reply with ok"' --verify-timeout 300
+```
+
+Codex currently uses the Responses API, so this release reports its capabilities as
+unavailable/inconclusive rather than treating Chat Completions success as evidence. See
+[docs/agent-profiles.md](docs/agent-profiles.md) for the profile contract and how to add
+one.
+
+## Reproducible research experiments
+
+The research runner repeats trials across independent targets, records request-level
+outcomes, and exports sanitized datasets. It is designed for measurement, not for
+fabricating or publishing compatibility claims. Automated tests use only the local mock
+server; no bundled result files are provider claims.
+
+```bash
+# Validate the config and print the resolved plan without credentials or requests.
+llm-compat research validate examples/research/three_free_providers.json
+
+# Show the same plan without sending anything.
+llm-compat research run examples/research/three_free_providers.json --dry-run
+
+# Run only after reviewing the plan and authorizing the cost.
+llm-compat research run examples/research/three_free_providers.json
+```
+
+The example compares three free-tier OpenAI-compatible providers. Free-tier model ids
+and limits change, so update the template from current provider documentation before
+running it. Credentials are read only from environment variables; the config rejects
+literal `api_key` fields.
+
+A run writes `raw_results.json`, `results.csv`, `requests.csv`, `summary.json`,
+`methodology.md`, `environment.json`, and `experiment.json` to the configured output
+directory. Resume skips completed trial ids only when the config fingerprint matches, so
+interrupted experiments continue without duplicate trials. Request budgets, deterministic
+randomized ordering, seeds, sample sizes, and client-side rate limits are all recorded.
+See [docs/research-experiments.md](docs/research-experiments.md) for the schema, output
+columns, statistics, and reproducibility rules.
+
 ## CLI reference
 
 ```text
-llm-compat run       Run compatibility checks and render a report
-llm-compat compare   Run the same checks against multiple configured targets
-llm-compat models    Discover models advertised by an endpoint
-llm-compat checks    List built-in checks (no network access)
-llm-compat providers List provider presets (no network access)
+llm-compat run              Run compatibility checks and render a report
+llm-compat compare          Run the same checks against multiple configured targets
+llm-compat models           Discover models advertised by an endpoint
+llm-compat checks           List built-in checks (no network access)
+llm-compat providers        List provider presets (no network access)
+llm-compat agent list       List coding-agent profiles (no network access)
+llm-compat agent test       Run protocol checks mapped to an agent profile
+llm-compat research validate Validate an experiment config (no network access)
+llm-compat research run     Run an authorized, resumable experiment
 ```
 
 Common connection and output options:
@@ -268,7 +374,18 @@ Additional `run` and `compare` options:
 | `--skip ID` | Skip this check. May be repeated. |
 | `--all` | Include the six opt-in checks. |
 | `--dry-run` | Print the plan and make no network requests. |
-| `--no-color` | Disable ANSI colors (`run` and `compare`). `NO_COLOR` is also honored. |
+| `--no-color` | Disable ANSI colors (`run`, `compare`, and `agent test`). `NO_COLOR` is also honored. |
+
+Agent and research options:
+
+| Option | Purpose |
+| --- | --- |
+| `agent test --agent KEY` | Select `aider`, `cline`, `codex`, `opencode`, or `roo-code`; aliases `roo`, `roocode`, and `open-code` are accepted. |
+| `--verify-command CMD` | Run the actual agent after protocol checks. Requires `--yes`. |
+| `--verify-timeout SECONDS` | Bound the verify command (default: 300). |
+| `research validate CONFIG` | Resolve and validate a config without credentials or requests. |
+| `research run CONFIG` | Run the experiment; prompts unless `--yes` is supplied. |
+| `--output-dir PATH` | Override the experiment output directory. |
 
 Examples:
 
@@ -290,6 +407,15 @@ llm-compat run --provider custom --base-url https://llm.example.com/v1 \
 # Write a CI artifact.
 llm-compat run --provider custom --base-url https://llm.example.com/v1 \
   --api-key-env MY_PROVIDER_KEY --yes --format json --output report.json
+
+# Map protocol checks to an agent profile without running the agent.
+llm-compat agent test --agent cline \
+  --provider custom --base-url https://llm.example.com/v1 \
+  --model example-chat --api-key-env MY_PROVIDER_KEY --yes --format json
+
+# Validate a resumable research experiment and then authorize it.
+llm-compat research validate examples/research/three_free_providers.json
+llm-compat research run examples/research/three_free_providers.json --yes
 ```
 
 ## Example terminal output
@@ -297,7 +423,7 @@ llm-compat run --provider custom --base-url https://llm.example.com/v1 \
 Illustrative output for an endpoint whose multi-turn tool calling fails:
 
 ```text
-LLM Compat 0.2.0
+LLM Compat 0.3.0
 Provider: custom  https://llm.example.com/v1
 Model: example-chat
 API key: configured
@@ -336,12 +462,12 @@ Summary
 
 `--format json` emits a stable document. Credentials are never serialized, and string
 surfaces are redacted for known secrets and common key patterns. This abridged example
-shows the 0.2 fields:
+shows the stable 0.3 fields:
 
 ```json
 {
   "schema_version": "1.0",
-  "tool": { "name": "llm-compat", "version": "0.2.0" },
+  "tool": { "name": "llm-compat", "version": "0.3.0" },
   "provider": {
     "name": "custom",
     "base_url": "https://llm.example.com/v1",
@@ -386,8 +512,8 @@ forward-compatible additions.
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Every selected check passed or warned, or a non-check command succeeded. |
-| `1` | A selected check failed, errored, or was skipped; or no check ran. |
+| `0` | Every selected check passed or warned; an agent report is `compatible`; a research run completed; or a non-check command succeeded. |
+| `1` | A selected check failed, errored, or was skipped; an agent report is `incompatible`, `partial`, or `inconclusive`; a research run was budget-limited or recorded an error; or no check ran. |
 | `2` | Usage, configuration, authorization, or output error. |
 | `130` | Interrupted with Ctrl-C. |
 
@@ -397,9 +523,12 @@ incompatible or incomplete run.
 ## Authorization, cost, and secrets
 
 - **Explicit authorization.** The library requires `RunOptions(authorize=True)` before
-  `run_compatibility()` or `compare_providers()` sends a request. The CLI requires
-  `--yes` or an interactive exact `yes`. Live JSON runs must pass `--yes` so they remain
-  non-interactive. Dry runs and non-live commands make no requests.
+  `run_compatibility()` or `compare_providers()` sends a request, and
+  `run_experiment(..., authorize=True)` before a research run sends one. The CLI requires
+  `--yes` or an interactive exact `yes`. Agent `--verify-command` runs also require
+  `--yes`. Live JSON runs must pass `--yes` so they remain non-interactive. Dry runs,
+  `agent list`, a Codex profile test without a verify command, and `research validate`
+  make no requests.
 - **Requests cost money.** A default run estimates `6 + samples` requests: one shared
   `/models` request (also used for automatic model selection), one each for chat,
   streaming, and JSON, two for the multi-turn tool check, and `samples` for latency.
@@ -478,6 +607,8 @@ llm_compat/
   checks/base.py      check contract, timing, status mapping, error info
   checks/_tooling.py  shared tool definitions and validation
   compare.py          multi-provider orchestration and rendering
+  agents/             agent profile registry, capability mapping, and reports
+  research/           experiment config, recording, runner, and exports
   results.py          status, failure classification, summaries
   report.py           stable JSON and terminal report rendering
   utils.py            redaction, truncation, URL and time helpers
@@ -500,6 +631,12 @@ previews.
 Check IDs are public API. Do not rename or repurpose one after release; add a new check
 instead. Keep each check focused on one compatibility property so the result identifies
 a concrete problem.
+
+To add an agent profile, define one `AgentProfile` with `AgentCapability` entries under
+`llm_compat/agents/profiles/`, export it from that package, and add tests. To add a
+research dimension, extend the config schema, record the extra condition, and export it;
+do not invent missing measurements. See [docs/agent-profiles.md](docs/agent-profiles.md)
+and [docs/research-experiments.md](docs/research-experiments.md).
 
 ## Development
 
@@ -539,6 +676,14 @@ python -m twine check dist/*
   check has one targeted fallback when a provider rejects streamed usage options.
 - Comparison runs sequentially. It is a compatibility report, not a load or capacity
   benchmark.
+- Agent profiles are protocol inferences unless a separate `--verify-command` execution
+  is recorded. They do not prove that an agent completes real coding tasks.
+- Current Codex requires the Responses API. This release does not implement Responses
+  checks, so Codex is reported as inconclusive rather than mapped onto Chat Completions.
+- Research experiments measure the conditions you configure. Free-tier model ids, rate
+  limits, routing, and prices can change; exported data is not a permanent provider claim.
+  Automatic model selection is recorded per trial but is not fixed by the config
+  fingerprint, so use an explicit model when reproducibility matters.
 - Live results are environment-specific and are not claimed as general provider
   compatibility in this repository.
 

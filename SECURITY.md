@@ -7,7 +7,7 @@ handling of credentials, URLs, and generated reports seriously.
 
 | Version | Supported |
 | --- | --- |
-| `0.2.x` | Yes |
+| `0.3.x` | Yes |
 
 While the project is pre-1.0, security fixes are made on the latest release only.
 
@@ -34,8 +34,9 @@ disclosure and release. Please allow time for a fix before publishing details.
 ## Security design
 
 - **Explicit authorization.** The library requires `RunOptions(authorize=True)` before a
-  live run. The CLI requires `--yes` or an interactive exact `yes`. Dry runs and non-live
-  commands make no requests.
+  live run and `run_experiment(..., authorize=True)` before a research request. The CLI
+  requires `--yes` or an interactive exact `yes`. Agent `--verify-command` execution
+  requires `--yes`. Dry runs, agent listing, and research validation make no requests.
 - **Environment-only keys.** The CLI accepts an environment variable name via
   `--api-key-env`, never a key literal. Cross-origin redirects are rejected, so requests
   and their Authorization headers go only to the configured endpoint (same-origin
@@ -76,9 +77,10 @@ llm-compat run --provider custom --base-url https://llm.example.com/v1 \
   --api-key-env MY_PROVIDER_KEY --model example-chat
 ```
 
-Reports and terminal output omit credentials, but they may still contain model names,
-short response previews, latency data, error details, and endpoint hostnames. Review a
-report before publishing it as a CI artifact.
+Reports, research datasets, and terminal output omit credentials, but they may still
+contain model names, short response previews, latency data, error details, endpoint
+hostnames, and timestamps. Review a report or experiment directory before publishing it
+as a CI artifact or sharing it. `research-output/` is ignored by Git but is not encrypted.
 
 ## Out of scope
 

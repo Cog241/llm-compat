@@ -30,7 +30,10 @@ Run these before opening a pull request:
 
 ```bash
 pytest
+pytest --cov=llm_compat --cov-report=term-missing
 ruff check .
+python -m build
+twine check dist/*
 ```
 
 CI runs the same commands on Python 3.9 through 3.13, then builds the sdist and wheel and
@@ -46,6 +49,9 @@ OpenAI-compatible API. Tests must:
 - Cover the success path plus relevant failure, warning, and error paths.
 - Avoid sleeps, wall-clock thresholds, and other sources of flakiness.
 - Assert on normalized results and sanitized output, not on secrets or raw headers.
+- Keep agent tests offline: profiles map to checks, and no real agent command runs.
+- Keep research tests offline: use the mock server, temporary output directories, and
+  explicit authorization, and never bundle generated results as fixtures.
 
 Do not add live-provider tests to the default suite. If you need an optional manual live
 check, require explicit authorization, keep it out of CI, and never commit the output.
@@ -75,6 +81,25 @@ Follow the optional live-testing procedure in
 Check IDs are public API. Once released, do not rename or repurpose an ID; add a new
 check instead. Keep a check focused on one compatibility property so failures identify
 a concrete problem.
+
+## Adding agent profiles
+
+Agent profiles describe documented requirements; they do not run the agents. Add one
+`AgentProfile` under `llm_compat/agents/profiles/`, using `capability()` to map each
+capability to an existing check id. Set `check_id=None` and `unavailable_reason` when no
+check exists rather than pointing at an unrelated probe. Export the profile from
+`llm_compat/agents/profiles/__init__.py`, append it to `PROFILES`, and add tests for the
+registry, required/optional mapping, verdicts, and suggestions. Update
+[docs/agent-profiles.md](docs/agent-profiles.md). Do not add live-agent tests to CI, and
+do not claim execution evidence unless an authorized command actually ran.
+
+## Adding research dimensions
+
+Research configs are explicit and reject unknown fields. If you add a condition, update
+`llm_compat/research/config.py`, include it in the canonical fingerprint, record it in the
+raw exports and methodology, and add offline tests against the local mock server. Never
+fill missing measurements with synthetic values. Use environment variable names for
+credentials and keep live runs out of the default suite.
 
 ## Adding provider presets and adapters
 

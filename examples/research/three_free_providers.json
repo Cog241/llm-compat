@@ -1,0 +1,48 @@
+{
+  "schema_version": "1.0",
+  "name": "Three free OpenAI-compatible providers",
+  "description": "Template for comparing three providers with free tiers. No results are bundled. Free-tier model ids and limits change; verify current provider documentation before running.",
+  "seed": 20260101,
+  "trials": 10,
+  "samples": 3,
+  "max_tokens": 128,
+  "randomize_order": true,
+  "request_budget": 400,
+  "rate_limit_per_second": 0.5,
+  "checks": [
+    "connectivity",
+    "auth",
+    "models",
+    "chat",
+    "streaming",
+    "latency",
+    "tools",
+    "json"
+  ],
+  "output_dir": "research-output/three-free-providers",
+  "resume": true,
+  "targets": [
+    {
+      "name": "groq-free",
+      "provider": "groq",
+      "model": "llama-3.1-8b-instant",
+      "api_key_env": "GROQ_API_KEY",
+      "timeout": 45.0
+    },
+    {
+      "name": "openrouter-free",
+      "provider": "openrouter",
+      "model": "meta-llama/llama-3.1-8b-instruct:free",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "timeout": 45.0
+    },
+    {
+      "name": "google-ai-studio",
+      "provider": "custom",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "model": "gemini-2.0-flash",
+      "api_key_env": "GEMINI_API_KEY",
+      "timeout": 45.0
+    }
+  ]
+}
